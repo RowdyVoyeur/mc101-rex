@@ -222,6 +222,13 @@ def main() -> int:
             assert lit == bitband, f"NARROW-REG-LB: bitband pool word {i} must be {bitband:#010x}, got {lit:#010x}"
         assert decode_bw(patched, t + 14) == 0x6001B052, "NARROW-REG-LB must resume at the NARROW-REG-B4 branch (0x6001B052)"
     assert patched[0x60035E74 - BASE_VA : 0x60035E78 - BASE_VA] == bytes.fromhex("41f05101"), "Bad UI-DIRTY-FDR orr r1, r1, #0x51"
+    # Single knob-mode merge targets in HandleKnobEvent must stay untouched stock 16-bit
+    # instructions (0x60036A8A branches to 0x60036A1A, 0x60036B8E branches to 0x60036B6E);
+    # placing a 32-bit BL spanning either target causes Single knob mode to jump mid-instruction and HardFault.
+    assert patched[0x60036A1A - BASE_VA : 0x60036A1C - BASE_VA] == bytes.fromhex("0646"), \
+        "0x60036A1A ('mov r6, r0') must stay stock: Single knob mode branches here from 0x60036A8A"
+    assert patched[0x60036B6E - BASE_VA : 0x60036B70 - BASE_VA] == bytes.fromhex("3620"), \
+        "0x60036B6E ('movs r0, #0x36') must stay stock: Single knob mode branches here from 0x60036B8E"
     assert patched[0x60337744 - BASE_VA : 0x60337747 - BASE_VA] == bytes.fromhex("161616"), "Bad FDR-ITCM-TBB"
     assert patched[0x60330874 - BASE_VA : 0x60330878 - BASE_VA] == bytes.fromhex("51f82610"), "FDR-TONE-FALLBACK must be reverted to stock 51f82610 @0x60330874"
     assert patched[0x60046420 - BASE_VA : 0x60046424 - BASE_VA] == stock[0x60046420 - BASE_VA : 0x60046424 - BASE_VA], "Unexpected modification at 0x60046420 (should be stock)"
