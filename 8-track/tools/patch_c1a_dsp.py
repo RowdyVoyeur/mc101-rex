@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-patch_c1a_dsp.py — Patch MC-101 Core 1 (RPG69_C1A_up.bin / sdram1.bin) to
-output Tracks 5-8 (DSP slots 0x258C..0x2593) alongside Tracks 1-4 (0x2584..0x258B)
-for 20-channel USB Audio IN.
-
-Relocates the Mixer/Output DSP program (0x610ADEE8..0x610B59D0) to the end of
-sdram1.bin and clones the stock Track 4 L/R output template (0x610B58A4..0x610B58C4)
-for Tracks 5-8 (0x258C..0x2593) plus silenced ch 19-20 (0x2C00..0x2C01), then
-repacks RPG69_C1A_up.bin into the QSPI container's trailing gap.
+patch_c1a_dsp.py — Patch MC-101 Core 1 (RPG69_C1A_up.bin / sdram1.bin) to:
+1. Output Tracks 5-8 (DSP slots 0x258C..0x2593) alongside Tracks 1-4 (0x2584..0x258B)
+   for 20-channel USB Audio IN (relocates the Mixer/Output DSP program
+   0x610ADEE8..0x610B59D0 to the end of sdram1.bin and clones the Track 4 L/R
+   output template for Tracks 5-8 plus silenced ch 19-20).
+2. Lift the 4-track routing clamps in Core 1's RecSource (0x6101EDA6) and
+   Scatter Position / DT1 Pos (0x6101F04E) handlers (`cmp rX, #5` -> `cmp rX, #9`)
+   so Tracks 5-8 (values 6..9) route to their individual tracks instead of MIXOUT.
 """
 
 from __future__ import annotations
@@ -78,6 +78,16 @@ PARAM_OFF_UPDATES = [
     (0x610B63AC, 0x7A40),
 ]
 
+# Core 1 ARM routing clamps in sdram1.bin that force Tracks 5-8 (values 6..9)
+# to MIXOUT (0x0A) even though the 8-track DSP tables and TBB switches already
+# support Tracks 1-8:
+#   - 0x6101EDA6 (RecSource, 0x6101ED98):        cmp r1, #5 -> cmp r1, #9
+#   - 0x6101F04E (Scatter Pos / DT1, 0x6101F02E): cmp r5, #5 -> cmp r5, #9
+ROUTING_CLAMP_PATCHES = [
+    ("RecSource", 0x6101EDA6, b"\x05\x29\xc8\xbf\x0a\x21", b"\x09\x29\xc8\xbf\x0a\x21"),
+    ("ScatterPos", 0x6101F04E, b"\x05\x2d\xc8\xbf\x0a\x25", b"\x09\x2d\xc8\xbf\x0a\x25"),
+]
+
 
 def u32(buf: bytes | bytearray, va: int) -> int:
     return struct.unpack_from("<I", buf, va - SDRAM1_BASE)[0]
@@ -131,6 +141,17 @@ def patch_sdram1(s101: bytes, c1a_data: bytes) -> bytes:
                 f"Unexpected DSP param offset at 0x{param_va:08x}: "
                 f"0x{got:08x} != 0x{expected_off:08x}"
             )
+
+    # Verify and lift Core 1 4-track routing clamps (RecSource & Scatter Pos/DT1)
+    for name, va, expected, replacement in ROUTING_CLAMP_PATCHES:
+        off = va - SDRAM1_BASE
+        got = bytes(buf[off : off + len(expected)])
+        if got != expected:
+            raise ValueError(
+                f"Unexpected {name} clamp bytes at 0x{va:08x}: "
+                f"{got.hex()} != {expected.hex()}"
+            )
+        buf[off : off + len(replacement)] = replacement
 
     ins_bytes = build_extra_channels(s101)
 
