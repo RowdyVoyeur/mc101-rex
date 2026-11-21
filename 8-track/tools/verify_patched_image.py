@@ -112,6 +112,8 @@ def main() -> int:
     assert patched[0x60046300 - BASE_VA : 0x60046302 - BASE_VA] == bytes.fromhex("082c"), "Bad post-load 8-track sync @0x60046300"
     assert patched[0x6008EC7A - BASE_VA : 0x6008EC7C - BASE_VA] == bytes.fromhex("0820"), "Bad project import 8-track count @0x6008EC7A"
     assert patched[0x60342EBA - BASE_VA : 0x60342EBC - BASE_VA] == bytes.fromhex("0822"), "Bad SEQ-ACTIVE-TRK (expected 0822)"
+    assert patched[0x603234B6 - BASE_VA : 0x603234B8 - BASE_VA] == bytes.fromhex("082c"), "Bad MIDI-RX-TRK-CNT @0x603234B6 (expected 082c = cmp r4, #8)"
+    assert patched[0x6003D674 - BASE_VA : 0x6003D67C - BASE_VA] == bytes.fromhex("a0f1db05082d30d2"), "Bad MIDI-CH-ALLOFF @0x6003D674"
     assert patched[0x600A0AF2 - BASE_VA : 0x600A0AF4 - BASE_VA] == bytes.fromhex("0420"), "Bad MIDI-ALL-OFF-CH (should be stock 0420)"
     assert patched[0x6005B422 - BASE_VA : 0x6005B426 - BASE_VA] == bytes.fromhex("00f015b8"), "Bad PRJ-LOAD-PRESERVE b.w 0x6005B450"
     assert patched[0x6005B452 - BASE_VA : 0x6005BEA0 - BASE_VA] == stock[0x6005B452 - BASE_VA : 0x6005BEA0 - BASE_VA], "Screen 0x16/0x17 project load event handler must be stock from 0x6005B452 onward"

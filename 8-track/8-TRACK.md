@@ -630,6 +630,8 @@ Regenerated from `manifest/sites.json` (run `python3 tools/gen_manifest.py` to r
 | `PRJ-LOAD-PRESERVE` | `0x6005B422` | 16 B | Project load: preserve tracks 5..8 clips/allocations (bypass stock wiping loop) |
 | `PRJ-POST-LOAD` | `0x60046424` | 6 B | Project load completion exit: `b.w tramp_prj_load_init` (a **tail call** of the stock epilogue `add sp, sp, #0x28` + `pop.w {r4-r10, pc}`) inits tracks 5..8 to unity `255` via `fw_set_param` + `fw_set_dsp_param`; without it the upper bank starts at **zero volume** (README §2, Attempts 9–10) |
 | `SEQ-TRK-CNT` | `0x60342EBA` | 2 B | Sequencer constructor: set active track count from 4 to 8 (movs r2, #8) |
+| `MIDI-RX-TRK-CNT` | `0x603234B6` | 2 B | ITCM incoming MIDI RX track-channel loop (exec `0x01010D1A`): extend `Track Ch1..4` scan to `Track Ch1..8` (`cmp r4, #4` -> `cmp r4, #8`) |
+| `MIDI-CH-ALLOFF` | `0x6003D674` | 20 B | `SYSTEM(MIDI)` Track Ch edit All-Sound-Off check: accept GPID `0xDB..0xE2` (`Track Ch1..8`) instead of `0xDB..0xDE` |
 | `USB-DESC-CH` | `0x602CA730` | 1 B | USB High-Speed Vendor Audio Streaming IN Format Type I descriptor `bNrChannels`: 10 (`0x0A`) -> 20 (`0x14`) |
 | `USB-DESC-PKT` | `0x602CA741` | 2 B | USB High-Speed Vendor Isochronous IN Endpoint (`0x8E`) `wMaxPacketSize`: 264 (`0x0108`) -> 524 (`0x020C`) |
 | `USB-INIT-CH` | `0x600AADE6` | 2 B | `USB_OnBusResetOrConnect`: configure hardware USB Audio IN bridge (`0x40080900`) for 20 channels (movs r6, #`0x14`) in Vendor mode |

@@ -469,6 +469,7 @@ itcm_knob_multi:
         # Fall-through targets inside UpdateFaderRgbLeds for the banked loop sites.
         "fdr_loop_top": 0x60099218,
         "fdr_led_id2_ret": 0x6009935C,
+        "midi_ch_alloff_exit": 0x6003D6DE,
     }
 
     def asm_at(va: int, body: str, length: int) -> str:
@@ -840,6 +841,25 @@ itcm_knob_multi:
             "seq",
             "code",
             "Sequencer constructor: set active track count from 4 to 8 (movs r2, #8).",
+        ),
+        # External MIDI RX Track Channel Loop & Channel-Change All-Sound-Off (4 -> 8)
+        (
+            "MIDI-RX-TRK-CNT",
+            0x603234B6,
+            2,
+            "082c",
+            "midi",
+            "code",
+            "ITCM incoming MIDI RX track-channel loop (exec 0x01010D1A): extend Track Ch1..4 scan to Track Ch1..8 (cmp r4, #4 -> cmp r4, #8).",
+        ),
+        (
+            "MIDI-CH-ALLOFF",
+            0x6003D674,
+            20,
+            asm_at(0x6003D674, "sub.w r5, r0, #0xdb\ncmp r5, #8\nbhs midi_ch_alloff_exit", 20),
+            "midi",
+            "code",
+            "SYSTEM(MIDI) Track Ch edit All-Sound-Off check (0x6003D674): accept GPID 0xDB..0xE2 (Track Ch1..8) instead of 0xDB..0xDE.",
         ),
         # USB Vendor Mode 20-Channel Audio Output (Interface 2 AltSetting 1)
         (
