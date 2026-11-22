@@ -1162,3 +1162,33 @@ The NARROW-REG image (whole CRC `0x4539FDD6`) was flashed and probed live
    written — the ESC2 applies a per-slot, per-product **write-enable mask**. Static
    write-byte audits must be paired with a readback probe before predicting routing
    behaviour; the readback is the hardware truth.
+
+---
+
+## 13. Button Navigation Mode (Hands-Free VALUE Dial Alternative)
+
+Implemented as a standalone, optional Core 0 feature in [`src/button_nav.c`](src/button_nav.c) using its own verified zero-padded SDRAM cave (`0x602DA600..0x602DAE7F`, 0 incoming references in stock, non-overlapping with `CAVE-01` and `CHOP-CAVE-0..3`).
+
+### 13.1 Verified ROM Key & LED Maps
+
+Extracted from the MC-101 v1.82 ROM key-name table (`0x602CABA4`), LED-name table (`0x602CAC44`), and 48-entry LED descriptor table (`0x601D0554`, all 4 LEDs verified `count = 1`, hardware blink `mode = 3`, full brightness `color = 0xFF` from `0x602CDCBC`):
+
+| Physical Button | Key ID | LED ID | Behavior in Button Nav Mode |
+| :--- | :---: | :---: | :--- |
+| `SHIFT` | `0x00` | `0x00` | Unchanged (`SHIFT + <` exits Nav Mode; `SHIFT + TEMPO` → `SHIFT + ENTER`) |
+| `<` (`MEAS_L`) | `0x03` | `0x03` | Synthetic `EV_DIAL(0, -1)` + hold auto-repeat; LED blinks |
+| `>` (`MEAS_R`) | `0x04` | `0x04` | Hold standalone 600 ms to enter; synthetic `EV_DIAL(0, +1)` + auto-repeat; LED blinks |
+| `TEMPO` | `0x0F` | `0x0F` | Rewritten to `KEY_ENTER (0x11)` on down & up; LED blinks |
+| `EXIT` | `0x10` | `0x10` | Unchanged; LED blinks |
+| `ENTER` (`VALUE` press) | `0x11` | — | Unchanged |
+
+### 13.2 Memory Map & Patch Sites (5 Active Sites)
+
+| Site ID | Address | Length | Role |
+| :--- | :--- | ---: | :--- |
+| `NAV-RAM` *(BSS)* | `0x602DA600..0x602DA6FF` | 256 B | Zero-init `NavState g_nav` pinned at `0x602DA600` via `.nav_state` (build-time asserted) |
+| `NAV-CODE` | `0x602DA700` | ~620 B | Compiled `src/button_nav.c` (`nav_tick_and_drain`, `nav_dispatch_event`) |
+| `NAV-LED-TRAMP` | `0x602DAE40` | 40 B | `tramp_nav_led_override`: if `g_nav.active` and `led_id ∈ {3, 4, 15, 16}`, force `mode = 3`, `color = 0xFF` |
+| `NAV-TICK-HOOK` | `0x6002EC24` | 4 B | Replaces `bl 0x6001de38` in the 50 ms main UI task loop with `bl nav_tick_and_drain` (600 ms hold detection via `fw_get_ms` `0x6001CC50` + 320 ms / 85 ms auto-repeat posting `EV_DIAL` via `0x6001D974`) |
+| `NAV-DISPATCH-HOOK` | `0x6001DE66` | 4 B | Replaces `bl 0x6001da18` in the central UI event drainer with `bl nav_dispatch_event` (intercepts before any screen or global key handler; checks global pressed-key bitmap `0x605C40B0[0..5]` so combos like `SHIFT+>`, `SEQ+>`, `SEL+>` pass through untouched) |
+| `NAV-LED-HOOK` | `0x6001E6B8` | 4 B | Replaces `fw_set_led` prologue (`push {r4-r6, lr}; mov r5, r1`) with `b.w tramp_nav_led_override` → `0x6001E6BC`; on `SHIFT + <` exit, clears LEDs `3, 4, 15, 16` then calls `fw_led_refresh_all(0x605C4E10)` (`0x60097A02`) |
