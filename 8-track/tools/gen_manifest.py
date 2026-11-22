@@ -311,23 +311,29 @@ tramp_drum_mute_press:
     .thumb_func
     .global tramp_knob_multi_r6
 tramp_knob_multi_r6:
+    @ KNOB-UI-MULTI1 (0x60036A16): replaces MULTI-only `subs r5, r0, #1; subs r0, r4, #7`
+    @ BEFORE 0x60036A1A (`mov r6, r0`), because Single knob mode (`0x60036A8A`) branches
+    @ directly to 0x60036A1A.
     push    {r1, r2, r3, lr}
+    subs    r5, r0, #1
     bl      get_cur_track
     and.w   r0, r0, #4
     subs    r1, r4, #7
     adds    r0, r0, r1
-    mov     r6, r0
     pop     {r1, r2, r3, pc}
 
     .thumb_func
     .global tramp_knob_multi_r5
 tramp_knob_multi_r5:
+    @ KNOB-UI-MULTI2 (0x60036B6A): replaces MULTI-only `mov r8, r0; subs r5, r4, #7`
+    @ BEFORE 0x60036B6E (`movs r0, #0x36`), because Single knob mode (`0x60036B8E`)
+    @ branches directly to 0x60036B6E.
     push    {r1, r2, r3, lr}
+    mov     r8, r0
     bl      get_cur_track
     and.w   r0, r0, #4
     subs    r5, r4, #7
     adds    r5, r5, r0
-    movs    r0, #0x36
     pop     {r1, r2, r3, pc}
 
     .thumb_func
@@ -463,6 +469,7 @@ itcm_knob_multi:
         # Fall-through targets inside UpdateFaderRgbLeds for the banked loop sites.
         "fdr_loop_top": 0x60099218,
         "fdr_led_id2_ret": 0x6009935C,
+        "midi_ch_alloff_exit": 0x6003D6DE,
     }
 
     def asm_at(va: int, body: str, length: int) -> str:
@@ -651,21 +658,21 @@ itcm_knob_multi:
         ),
         (
             "KNOB-UI-MULTI1",
-            0x60036A18,
+            0x60036A16,
             4,
-            asm_at(0x60036A18, "bl tramp_knob_multi_r6", 4),
+            asm_at(0x60036A16, "bl tramp_knob_multi_r6", 4),
             "mixer",
             "hook",
-            "HandleKnobEvent MULTI popup (0x60036A18): offset knob track index r6 by active bank (CurTrack & 4).",
+            "HandleKnobEvent MULTI popup (0x60036A16): offset knob track index by active bank (CurTrack & 4) before Single-mode merge target 0x60036A1A.",
         ),
         (
             "KNOB-UI-MULTI2",
-            0x60036B6C,
+            0x60036B6A,
             4,
-            asm_at(0x60036B6C, "bl tramp_knob_multi_r5", 4),
+            asm_at(0x60036B6A, "bl tramp_knob_multi_r5", 4),
             "mixer",
             "hook",
-            "HandleKnobEvent MULTI edit (0x60036B6C): offset knob track index r5 by active bank (CurTrack & 4).",
+            "HandleKnobEvent MULTI edit (0x60036B6A): offset knob track index r5 by active bank (CurTrack & 4) before Single-mode merge target 0x60036B6E.",
         ),
         # Menu Parameter Providers: 1. RECORDING: RecSource (GPID 0x23F)
         (
@@ -834,6 +841,25 @@ itcm_knob_multi:
             "seq",
             "code",
             "Sequencer constructor: set active track count from 4 to 8 (movs r2, #8).",
+        ),
+        # External MIDI RX Track Channel Loop & Channel-Change All-Sound-Off (4 -> 8)
+        (
+            "MIDI-RX-TRK-CNT",
+            0x603234B6,
+            2,
+            "082c",
+            "midi",
+            "code",
+            "ITCM incoming MIDI RX track-channel loop (exec 0x01010D1A): extend Track Ch1..4 scan to Track Ch1..8 (cmp r4, #4 -> cmp r4, #8).",
+        ),
+        (
+            "MIDI-CH-ALLOFF",
+            0x6003D674,
+            20,
+            asm_at(0x6003D674, "sub.w r5, r0, #0xdb\ncmp r5, #8\nbhs midi_ch_alloff_exit", 20),
+            "midi",
+            "code",
+            "SYSTEM(MIDI) Track Ch edit All-Sound-Off check (0x6003D674): accept GPID 0xDB..0xE2 (Track Ch1..8) instead of 0xDB..0xDE.",
         ),
         # USB Vendor Mode 20-Channel Audio Output (Interface 2 AltSetting 1)
         (
