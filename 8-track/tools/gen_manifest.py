@@ -76,6 +76,83 @@ SECTIONS {{
         return bin_file.read_bytes(), syms
 
 
+def compile_single_cave_c(
+    c_path: Path,
+    code_va: int,
+    code_max: int,
+    ram_va: int,
+    ram_max: int,
+    state_sec: str,
+) -> tuple[bytes, dict[str, int]]:
+    """Compile a freestanding Cortex-M7 Thumb-2 C module into one verified code cave + .bss cave."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        o_file = tmp / "mod.o"
+        elf_file = tmp / "mod.elf"
+        bin_file = tmp / "mod.bin"
+        ld_file = tmp / "mod.ld"
+        ld_file.write_text(
+            f"""
+MEMORY {{
+    CODE (rx)  : ORIGIN = 0x{code_va:08x}, LENGTH = 0x{code_max:x}
+    RAM  (rwx) : ORIGIN = 0x{ram_va:08x}, LENGTH = 0x{ram_max:x}
+}}
+SECTIONS {{
+    .code : {{
+        *(.text*)
+        *(.rodata*)
+        . = ALIGN(4);
+    }} > CODE
+    .data : {{
+        *(.data*)
+    }} > RAM
+    .bss (NOLOAD) : {{
+        *({state_sec})
+        *(.bss*)
+        *(COMMON)
+    }} > RAM
+    /DISCARD/ : {{ *(.ARM.exidx*) *(.ARM.extab*) *(.comment) *(.note*) }}
+}}
+""",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "arm-none-eabi-gcc",
+                "-mcpu=cortex-m7",
+                "-mthumb",
+                "-Os",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-c",
+                str(c_path),
+                "-o",
+                str(o_file),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["arm-none-eabi-ld", "-T", str(ld_file), str(o_file), "-o", str(elf_file)],
+            check=True,
+        )
+        subprocess.run(
+            ["arm-none-eabi-objcopy", "-O", "binary", "-j", ".code", str(elf_file), str(bin_file)],
+            check=True,
+        )
+        nm_out = subprocess.check_output(["arm-none-eabi-nm", "-n", str(elf_file)], text=True)
+        syms: dict[str, int] = {}
+        for line in nm_out.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and not parts[2].startswith("$"):
+                syms[parts[2]] = int(parts[0], 16)
+        blob = bin_file.read_bytes()
+        assert len(blob) <= code_max, f"{c_path.name} ({len(blob)}B) exceeds cave budget ({code_max}B)"
+        return blob, syms
+
+
 def pad_nops(code: bytes, target_len: int) -> bytes:
     if len(code) > target_len:
         raise ValueError(f"assembled code ({len(code)}B) exceeds target length ({target_len}B)")
@@ -460,11 +537,66 @@ itcm_knob_multi:
         if not k.startswith("$"):
             print(f"    {k:24s} = 0x{v:08X}")
 
+    # 3. Button Navigation Mode (Hold '>' to map '<'/'>' -> VALUE dial, 'TEMPO' -> ENTER, blink '<'/'>'/'TEMPO'/'EXIT')
+    #    Verified zero-padded SDRAM cave 0x602DA600..0x602DAE7F (0 incoming refs, non-overlapping with other features):
+    #      0x602DA600..0x602DA6FF (256 B)   : NAV-RAM (.bss, g_nav pinned first via .nav_state)
+    #      0x602DA700..0x602DAE3F (1,856 B) : NAV-CODE (compiled 8-track/src/button_nav.c)
+    #      0x602DAE40..0x602DAE7F (64 B)    : NAV-LED-TRAMP (tramp_nav_led_override)
+    nav_ram_va, nav_ram_max = 0x602DA600, 0x0100
+    nav_code_va, nav_code_max = 0x602DA700, 0x0740
+    nav_tramp_va, nav_tramp_max = 0x602DAE40, 0x0040
+    nav_c_path = REPO_ROOT / "8-track/src/button_nav.c"
+    nav_code_blob, nav_syms = compile_single_cave_c(
+        nav_c_path, nav_code_va, nav_code_max, nav_ram_va, nav_ram_max, ".nav_state"
+    )
+    nav_state_va = nav_syms.get("g_nav")
+    assert nav_state_va == nav_ram_va, f"g_nav expected at 0x{nav_ram_va:08X}, got {hex(nav_state_va or 0)}"
+    assert "nav_tick_and_drain" in nav_syms and "nav_dispatch_event" in nav_syms
+    print(
+        f"[+] Button Nav Mode C module @0x{nav_code_va:08X}: {len(nav_code_blob)}/{nav_code_max} B "
+        f"(tick=0x{nav_syms['nav_tick_and_drain']:08X}, dispatch=0x{nav_syms['nav_dispatch_event']:08X}, g_nav=0x{nav_state_va:08X})"
+    )
+
+    nav_tramp_ext = {"fw_set_led_cont": 0x6001E6BC}
+    nav_tramp_asm = f"""
+    .balign 2
+    .thumb_func
+    .global tramp_nav_led_override
+tramp_nav_led_override:
+    @ Hooked at 0x6001E6B8 (stock 4B: push {{r4, r5, r6, lr}}; mov r5, r1)
+    @ r0 = led_id, r1 = mode, r2 = color; r3 is caller-saved scratch
+    movw    r3, #0x{nav_state_va & 0xFFFF:04x}
+    movt    r3, #0x{(nav_state_va >> 16) & 0xFFFF:04x}
+    ldrb    r3, [r3, #0]        @ g_nav.active
+    cbz     r3, 1f
+    cmp     r0, #3              @ LED_MEAS_L (<)
+    beq     2f
+    cmp     r0, #4              @ LED_MEAS_R (>)
+    beq     2f
+    cmp     r0, #15             @ LED_TEMPO
+    beq     2f
+    cmp     r0, #16             @ LED_EXIT
+    bne     1f
+2:
+    movs    r1, #3              @ mode = 3 (BLINK)
+    movs    r2, #0xff           @ full brightness
+1:
+    push    {{r4, r5, r6, lr}}
+    mov     r5, r1
+    b.w     fw_set_led_cont
+"""
+    nav_tramp_raw, nav_tramp_syms = assemble_thumb(nav_tramp_va, nav_tramp_asm, nav_tramp_ext)
+    nav_tramp_code = pad_nops(nav_tramp_raw, (len(nav_tramp_raw) + 3) & ~3)
+    assert len(nav_tramp_code) <= nav_tramp_max, f"NAV-LED-TRAMP ({len(nav_tramp_code)}B) exceeds {nav_tramp_max}B"
+    print(f"[+] Button Nav LED trampoline @0x{nav_tramp_va:08X}: {len(nav_tramp_raw)}/{nav_tramp_max} B")
+
     all_ext = {
         **sdram_ext,
         **itcm_ext,
         **cave_syms,
         **itcm_syms,
+        **nav_syms,
+        **nav_tramp_syms,
         "target_exit": 0x6005B450,
         # Fall-through targets inside UpdateFaderRgbLeds for the banked loop sites.
         "fdr_loop_top": 0x60099218,
@@ -943,6 +1075,52 @@ itcm_knob_multi:
             "ui",
             "table",
             "LCD splash screen line 1: 'Roland MC-101   ' -> 'Roland MC-107   '.",
+        ),
+        # Button Navigation Mode (Hold '>' to enter; '<'/'>' = VALUE dial w/ repeat, TEMPO = ENTER, blink 4 LEDs; SHIFT+'<' = exit)
+        (
+            "NAV-CODE",
+            nav_code_va,
+            len(nav_code_blob),
+            nav_code_blob.hex(),
+            "nav",
+            "code",
+            "Button Navigation Mode C module (hold '>' enter, '<'/'>' VALUE dial w/ auto-repeat, TEMPO->ENTER, SHIFT+'<' exit) in verified zero-padded cave 0x602DA700.",
+        ),
+        (
+            "NAV-LED-TRAMP",
+            nav_tramp_va,
+            len(nav_tramp_code),
+            nav_tramp_code.hex(),
+            "nav",
+            "code",
+            "Button Navigation Mode LED blink override trampoline for MEAS_L(3), MEAS_R(4), TEMPO(15), EXIT(16).",
+        ),
+        (
+            "NAV-TICK-HOOK",
+            0x6002EC24,
+            4,
+            asm_at(0x6002EC24, "bl nav_tick_and_drain", 4),
+            "nav",
+            "hook",
+            "Main UI loop tick hook (0x6002EC24): check 600ms '>' hold and '<'/'>' auto-repeat before draining UI event queue.",
+        ),
+        (
+            "NAV-DISPATCH-HOOK",
+            0x6001DE66,
+            4,
+            asm_at(0x6001DE66, "bl nav_dispatch_event", 4),
+            "nav",
+            "hook",
+            "Central UI event dispatch hook (0x6001DE66): remap '<'/'>'->VALUE dial and TEMPO->ENTER while Button Nav Mode is active.",
+        ),
+        (
+            "NAV-LED-HOOK",
+            0x6001E6B8,
+            4,
+            asm_at(0x6001E6B8, "b.w tramp_nav_led_override", 4),
+            "nav",
+            "hook",
+            "fw_set_led entry hook (0x6001E6B8): keep '<', '>', 'TEMPO', and 'EXIT' LEDs blinking continuously while Button Nav Mode is active.",
         ),
     ]
 
