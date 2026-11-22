@@ -32,12 +32,13 @@ Both `RPG69_C0A_up.bin` and `RPG69_C1A_up.bin` must be flashed to the device (co
 - [`build.py`](build.py) — top-level build and verification driver
 - [`manifest/sites.json`](manifest/sites.json) — Core 0 patch-site manifest
 - [`src/sample_chop.c`](src/sample_chop.c) — freestanding Cortex-M7 C module for `SMPL CHOP` (Screen `0x68`)
+- [`src/button_nav.c`](src/button_nav.c) — freestanding Cortex-M7 C module for Button Navigation Mode
 - [`tools/`](tools/) — final patch, manifest generation, and verification scripts (`gen_manifest.py`, `patch_image.py`, `verify_patched_image.py`, `patch_c1a_dsp.py`)
 - [`investigation/`](investigation/) — scouting and reverse-engineering scripts used during development (`c1img.py`, `scan_c1_*.py`, `scout_strings.py`)
 
 ## Status
 
-All 83 active Core 0 patches are implemented in [`manifest/sites.json`](manifest/sites.json) and generated reproducibly by [`tools/gen_manifest.py`](tools/gen_manifest.py), and the Core 1 DSP patch is implemented in [`tools/patch_c1a_dsp.py`](tools/patch_c1a_dsp.py):
+All 88 active Core 0 patches are implemented in [`manifest/sites.json`](manifest/sites.json) and generated reproducibly by [`tools/gen_manifest.py`](tools/gen_manifest.py), and the Core 1 DSP patch is implemented in [`tools/patch_c1a_dsp.py`](tools/patch_c1a_dsp.py):
 
 - **Track selection toggle & bank switching (`UI-03`, `UI-DIRTY-FDR`, `SEL-03`, `CAVE-01`)**: Pressing the already-selected `SEL1..SEL4` button toggles between Bank A (Tracks 1–4) and Bank B (Tracks 5–8); pressing a different `SEL1..SEL4` button selects that slot within the active bank (`CurTrack & 4`). Updates `0x602D27FC` and `0x61800200` atomically. `UI-DIRTY-FDR` at `0x60035E74` asserts UI dirty bit 4 (`0x10`) so `UpdateFaderRgbLeds` immediately renders the selected bank. Holding `[SHIFT]` (`button 0`) + `[SEL1..4]` enters the `EDIT` menu (`Screen 0x36`) for that track, and pressing `[SHIFT]` + the same track button again while in `EDIT` mode toggles between the `EDIT` menu for the printed track (`1..4`) and the `+4` track (`5..8`).
 - **Volume faders & `MULTI` knobs (`FDR-ITCM-TBB`, `FDR-ITCM-CODE`, `KNOB-ITCM-MULTI`, `KNOB-UI-MULTI1`, `KNOB-UI-MULTI2`)**: Replaces the 4 unrolled fader handlers in ITCM (`0x01024FD2..0x01025050`) with a unified bank-aware fader handler (`0x3F + track * 3`) and bank-switches `C1..C4` in `MULTI` knob mode so faders 1–4 and `C1..C4` control Tracks 5–8 whenever Track 5, 6, 7, or 8 is selected. `KNOB-UI-MULTI1` (`0x60036A16`) and `KNOB-UI-MULTI2` (`0x60036B6A`) hook strictly before the `Single` knob-mode branch targets (`0x60036A1A`, `0x60036B6E`) so `System > Knob Trk = Single` works cleanly across all 8 tracks.
@@ -48,6 +49,7 @@ All 83 active Core 0 patches are implemented in [`manifest/sites.json`](manifest
 - **MC-707-Depth Drum Pad Edit (`DRUM-ENV-CLIP-HOOK`, `DRUM-PAD-EDIT-TBL`, `PAD-EDIT-*`, `WMT4-*-BUGFIX`)**: Expands `SHIFT + PAD → PAD EDIT` from 3 sections to **11 sections** (147 newly exposed Zen-Core parameters across `INST EDIT`, `WMT1–WMT4`, `TVF/TVA`, `PITCH ENV`, `TVF ENV`, `TVA ENV`, and stock `PAD EDIT` / `EQ EDIT`), syncs clip context for the 3 envelope parameter groups, and fixes two stock Roland bugs on `WMT4` (`WMT4-FMT-BUGFIX` and `WMT4-SET-BUGFIX`). Hardware verified.
 - **Per-Layer WAV Loading & Sample Editing (`PAD-SND-*`, `DRUM-PHASE2-HOOKS`, `PAD-WAV-BIND-WMT`, `SMPL-EDIT-*`, `SAMPLE-DEL-WMT-FIX`)**: Expands the `SHIFT + PAD` Drum Pad Sound Menu from 5 to **13 items**, adding non-destructive **`WMT1 WAVE`–`WMT4 WAVE`** loaders (preserving existing layers on the pad), **`WMT1 SMPL`–`WMT4 SMPL`** Sample Edit shortcuts, and updating Sample Delete reference scanning across all 4 WMT layers so samples loaded into `WMT2`–`WMT4` are never falsely marked unused. Hardware verified.
 - **Sample Chop, 16×2 LCD Waveform, & Pad Assign (`SCR-*`, `CHOP-CODE`, `CHOP-SLICE`, `CHOP-DETECT`, `CHOP-PAD-AUDIO-GATE`, [`src/sample_chop.c`](src/sample_chop.c))**: Registers custom **Screen `0x68` (`SMPL CHOP`)** in the relocated 105-entry screen table with live 16×2 CGRAM waveform & slice/transient markers (`1x`–`32x` zoom), equal-step (`1/4/8/16/32`), auto transient detection, manual slice add/delete/nudge, isolated real-time slice audition on Pads 1–16 (`SHIFT+Pad` for 17–32), and auto/manual pad assignment that writes real truncated User Samples into external Wave RAM and syncs to Core 1 DSP. Hardware verified.
+- **Button Navigation Mode — Hands-Free VALUE Dial Alternative (`NAV-CODE`, `NAV-LED-TRAMP`, `NAV-TICK-HOOK`, `NAV-DISPATCH-HOOK`, `NAV-LED-HOOK`, [`src/button_nav.c`](src/button_nav.c))**: Global menu navigation mode using the `<`, `>`, `TEMPO`, and `EXIT` buttons in place of the VALUE encoder, with hold-to-scroll auto-repeat and blinking visual indicator LEDs. Lives in its own non-overlapping zero-padded SDRAM cave (`0x602DA600..0x602DAE7F`).
 
 ---
 
@@ -132,6 +134,24 @@ Stock MC-101 only exposes 3 sections in `PAD EDIT` (`PAD EDIT`, a 3-item `INST E
    - `SHIFT + VALUE` press **commits** the assignment.
 7. **`>SRC` (Source Pad / Layer)** — e.g. `>SRC P01 W1 02.4`
    - Displays source pad, source layer (`W1`–`W4`), and total sample length in seconds. Turn `VALUE` dial to switch source layer `W1`–`W4`, or tap any Pad 1–16 (with normal pad sound audible) to switch to chopping another pad's sample.
+
+---
+
+## User Guide: Button Navigation Mode (VALUE Dial Alternative)
+
+Button Navigation Mode provides an optional, global alternative to rotating and pressing the `VALUE` dial — useful for worn encoders or fast one-handed button navigation across every screen and menu on the MC-101 (System, Track, Clip, Preset/WAV browsers, Pad Edit, Sample Chop, etc.).
+
+- **Enter Button Nav Mode:** Hold the **`>`** (Measure Right) button **alone** for **~600 ms**.
+  - Short-tapping `>` (< 600 ms) still advances measures/octaves normally.
+  - Multi-button combos (`SHIFT + >`, `SEQ + >`, `SEL1–4 + >`, etc.) pass straight through with zero delay.
+- **Visual Indicator:** While active, the **`<`**, **`>`**, **`TEMPO`**, and **`EXIT`** button LEDs all **blink continuously** across every screen.
+- **Controls while active:**
+  - **`<`** → Rotate **`VALUE` dial left (`-1`)**. Hold `<` for continuous auto-repeat scrolling (~320 ms initial delay, then ~10 steps/sec).
+  - **`>`** → Rotate **`VALUE` dial right (`+1`)**. Hold `>` for continuous auto-repeat scrolling.
+  - **`TEMPO`** → Press **`VALUE` / `ENTER` (OK / Select)**. Holding **`SHIFT + TEMPO`** also works as **`SHIFT + VALUE`**.
+  - **`EXIT`** → Normal **`EXIT`** (back / exit menu).
+  - **All other buttons & the physical `VALUE` dial** keep their exact stock functions.
+- **Exit Button Nav Mode:** Press **`SHIFT + <`**. Immediately exits Nav Mode, suppresses the `<` event, and restores `<`, `>`, `TEMPO`, and `EXIT` LEDs to their normal states.
 
 ---
 

@@ -1207,3 +1207,33 @@ All additions below run purely on Core 0 (`RPG69_C0A_up.bin`) using verified zer
   - **Live WMT layer soloing**: Uses Roland's live parameter API `fw_set_param(0xFB + track, 0x8E1 + w*0x17, want, pad_idx, clip)` (`WMT1..4 Switch`) and `pid = 0x8E0` (`WMT Velo`) so Core 1 DSP immediately mutes all other WMT layers (both Preset `INT` waves and other `SAMP` layers) on the source pad during preview and restores them on `EXIT`/pad change.
   - **Real-time trigger**: Temporarily sets source User Sample Start/End (`0x11F / 0x98D, 0x98F`) and sends real-time Note-Off/Note-On directly to Core 1 internal synth port `2` (`0x60019FD6` → `0x60019FE0(2, msg)` → `0x60019EFA`).
 - **Real truncated User Sample creation & Core 1 sync (`create_sliced_sample`)**: Allocates a free sample slot (`0..499`) and contiguous 32 KB Wave RAM blocks (`0x6002645C`), copies PCM + 64 B lead-in/tail zeros, populates 40-byte `SampleHeader` L/R entries + 1-to-1 block ownership (`0x6001A526`), initializes sample params (`0x6002DEEC`), pushes sample metadata to Core 1 via IPC `0xFFFA` (`0x60096510` → `0x60096548` → `0x6002D1AC` → `0x60019F36`), binds via `fw_bind_pad_wav` (`0x600299A4`, default `W1`) or non-destructive WMT bind (`W2..4`), and marks/syncs the clip (`0x6001A1A2`, `0x60046434`).
+
+---
+
+## 13. Button Navigation Mode (Hands-Free VALUE Dial Alternative)
+
+Implemented as a standalone, optional Core 0 feature in [`src/button_nav.c`](src/button_nav.c) using its own verified zero-padded SDRAM cave (`0x602DA600..0x602DAE7F`, 0 incoming references in stock, non-overlapping with `CAVE-01` and `CHOP-CAVE-0..3`).
+
+### 13.1 Verified ROM Key & LED Maps
+
+Extracted from the MC-101 v1.82 ROM key-name table (`0x602CABA4`), LED-name table (`0x602CAC44`), and 48-entry LED descriptor table (`0x601D0554`, all 4 LEDs verified `count = 1`, hardware blink `mode = 3`, full brightness `color = 0xFF` from `0x602CDCBC`):
+
+| Physical Button | Key ID | LED ID | Behavior in Button Nav Mode |
+| :--- | :---: | :---: | :--- |
+| `SHIFT` | `0x00` | `0x00` | Unchanged (`SHIFT + <` exits Nav Mode; `SHIFT + TEMPO` → `SHIFT + ENTER`) |
+| `<` (`MEAS_L`) | `0x03` | `0x03` | Synthetic `EV_DIAL(0, -1)` + hold auto-repeat; LED blinks |
+| `>` (`MEAS_R`) | `0x04` | `0x04` | Hold standalone 600 ms to enter; synthetic `EV_DIAL(0, +1)` + auto-repeat; LED blinks |
+| `TEMPO` | `0x0F` | `0x0F` | Rewritten to `KEY_ENTER (0x11)` on down & up; LED blinks |
+| `EXIT` | `0x10` | `0x10` | Unchanged; LED blinks |
+| `ENTER` (`VALUE` press) | `0x11` | — | Unchanged |
+
+### 13.2 Memory Map & Patch Sites (5 Active Sites)
+
+| Site ID | Address | Length | Role |
+| :--- | :--- | ---: | :--- |
+| `NAV-RAM` *(BSS)* | `0x602DA600..0x602DA6FF` | 256 B | Zero-init `NavState g_nav` pinned at `0x602DA600` via `.nav_state` (build-time asserted) |
+| `NAV-CODE` | `0x602DA700` | ~620 B | Compiled `src/button_nav.c` (`nav_tick_and_drain`, `nav_dispatch_event`) |
+| `NAV-LED-TRAMP` | `0x602DAE40` | 40 B | `tramp_nav_led_override`: if `g_nav.active` and `led_id ∈ {3, 4, 15, 16}`, force `mode = 3`, `color = 0xFF` |
+| `NAV-TICK-HOOK` | `0x6002EC24` | 4 B | Replaces `bl 0x6001de38` in the 50 ms main UI task loop with `bl nav_tick_and_drain` (600 ms hold detection via `fw_get_ms` `0x6001CC50` + 320 ms / 85 ms auto-repeat posting `EV_DIAL` via `0x6001D974`) |
+| `NAV-DISPATCH-HOOK` | `0x6001DE66` | 4 B | Replaces `bl 0x6001da18` in the central UI event drainer with `bl nav_dispatch_event` (intercepts before any screen or global key handler; checks global pressed-key bitmap `0x605C40B0[0..5]` so combos like `SHIFT+>`, `SEQ+>`, `SEL+>` pass through untouched) |
+| `NAV-LED-HOOK` | `0x6001E6B8` | 4 B | Replaces `fw_set_led` prologue (`push {r4-r6, lr}; mov r5, r1`) with `b.w tramp_nav_led_override` → `0x6001E6BC`; on `SHIFT + <` exit, clears LEDs `3, 4, 15, 16` then calls `fw_led_refresh_all(0x605C4E10)` (`0x60097A02`) |
