@@ -320,11 +320,59 @@ def main() -> int:
         cave_insns = list(md.disasm(patched[0x602D2600 - BASE_VA : 0x602D27FC - BASE_VA], 0x602D2600))
         assert len(cave_insns) >= 50, f"Unexpectedly few instructions in SDRAM cave: {len(cave_insns)}"
 
-        # SDRAM cave 2 (0x602D2B00..0x602D2BFF) was freed when the diagnostic probes
-        # were removed; it must stay untouched stock padding.
-        cave2_area = patched[0x602D2B00 - BASE_VA : 0x602D2C00 - BASE_VA]
-        assert cave2_area == stock[0x602D2B00 - BASE_VA : 0x602D2C00 - BASE_VA], "Freed SDRAM cave 2 must be stock"
-        assert cave2_area.count(0x00) == len(cave2_area), "Freed SDRAM cave 2 should be zero padding"
+        # Verify Phase 1 MC-707-depth Drum Pad Edit (11 sections @ 0x602D2B00 + WMT4 bugfixes + Env clip hook)
+        assert patched[0x6004E12A - BASE_VA : 0x6004E12C - BASE_VA] == bytes.fromhex("0b22"), \
+            "Bad PAD-EDIT-SEC-CNT (expected 0b22 = movs r2, #11)"
+        sec_ptr = struct.unpack_from("<I", patched, 0x6004E1A8 - BASE_VA)[0]
+        assert sec_ptr == 0x602D2B00, f"Bad PAD-EDIT-SEC-PTR: expected 0x602D2B00, got {hex(sec_ptr)}"
+        assert decode_bl(patched, 0x6004E108) == 0x602D2A90, "Bad PAD-EDIT-ENV-CLIP branch target"
+        assert patched[0x6008BB0A - BASE_VA : 0x6008BB0E - BASE_VA] == bytes.fromhex("424600bf"), "Bad WMT4-FMT-BUGFIX"
+        assert patched[0x6008BE04 - BASE_VA : 0x6008BE08 - BASE_VA] == bytes.fromhex("1a4600bf"), "Bad WMT4-SET-BUGFIX"
+        # Verify all 11 section descriptors resolve to valid tables and NUL-terminated titles <= 10 chars
+        sec_counts = []
+        for si in range(11):
+            t_va, cnt, title_va = struct.unpack_from("<3I", patched, (sec_ptr + si * 12) - BASE_VA)
+            t_off = title_va - BASE_VA
+            t_end = patched.find(b"\x00", t_off, t_off + 16)
+            title = patched[t_off:t_end].decode("ascii")
+            assert len(title) <= 10, f"Section {si} title {title!r} exceeds 10-char row-0 budget"
+            sec_counts.append(cnt)
+        assert sec_counts == [13, 10, 23, 23, 23, 23, 8, 14, 14, 9, 8], f"Unexpected Drum Pad Edit section counts: {sec_counts}"
+        drum_tramp_insns = list(md.disasm(patched[0x602D2A90 - BASE_VA : 0x602D2AE0 - BASE_VA], 0x602D2A90))
+        assert len(drum_tramp_insns) >= 12, f"Unexpectedly few instructions in DRUM-ENV-CLIP-HOOK: {len(drum_tramp_insns)}"
+
+        # Verify Phase 2+3: 12-entry Drum Pad SOUND menu, WMT1..4 WAV loader & Sample Edit hooks, and SAMPLE DELETE fix
+        assert patched[0x6006A376 - BASE_VA : 0x6006A378 - BASE_VA] == bytes.fromhex("0728"), "Bad PAD-SND-HDR-SPLIT"
+        assert struct.unpack_from("<I", patched, 0x6006A430 - BASE_VA)[0] == 0x602D3D80, "Bad PAD-SND-MENU-PTR1"
+        assert struct.unpack_from("<I", patched, 0x6006A648 - BASE_VA)[0] == 0x602D3D80, "Bad PAD-SND-MENU-PTR2"
+        snd_modes = []
+        for mi in range(12):
+            lbl_va, scr_id, mode = struct.unpack_from("<3I", patched, (0x602D3D80 + mi * 12) - BASE_VA)
+            l_off = lbl_va - BASE_VA
+            lbl = patched[l_off : patched.find(b"\x00", l_off)].decode("ascii")
+            snd_modes.append((lbl, scr_id, mode))
+        assert [x[0] for x in snd_modes] == [
+            "PRESET", "PROJECT", "WAVE FILE", "WMT1 WAVE", "WMT2 WAVE", "WMT3 WAVE", "WMT4 WAVE",
+            "PAD EDIT", "WMT1 SMPL", "WMT2 SMPL", "WMT3 SMPL", "WMT4 SMPL",
+        ], f"Unexpected Drum Pad SOUND menu labels: {snd_modes}"
+        assert [x[2] for x in snd_modes[2:7]] == [0, 1, 2, 3, 4], f"Unexpected WMT WAVE modes: {snd_modes[2:7]}"
+        assert [x[2] for x in snd_modes[8:12]] == [1, 2, 3, 4], f"Unexpected WMT SMPL modes: {snd_modes[8:12]}"
+        assert decode_bl(patched, 0x6006A574) == 0x602D3EC8, "Bad PAD-SND-CLR-HOOK target"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x6006A5E0) < 0x602D40E0, "Bad PAD-SND-ENTER-HOOK target"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x6002132E) < 0x602D40E0, "Bad PAD-WAV-BIND-WMT target"
+        assert patched[0x60021506 - BASE_VA : 0x6002150A - BASE_VA] == stock[0x60021506 - BASE_VA : 0x6002150A - BASE_VA], \
+            "cmd 8 (0x60021506) must stay stock"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x600877D6) < 0x602D40E0, "Bad SAMPLE-DEL-WMT-FIX target"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x6007C3BE) < 0x602D40E0, "Bad SMPL-EDIT-GET1 target"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x6007C504) < 0x602D40E0, "Bad SMPL-EDIT-GET2 target"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x6007C468) < 0x602D40E0, "Bad SMPL-EDIT-HDR target"
+        # Verify 4 x WMT1..4 SAMPLE descriptors @ 0x602D3E60
+        for wi in range(4):
+            t_va, cnt, title_va = struct.unpack_from("<3I", patched, (0x602D3E60 + wi * 12) - BASE_VA)
+            assert t_va == 0x602D7BE4 and cnt == 8
+            t_off = title_va - BASE_VA
+            t = patched[t_off : patched.find(b"\x00", t_off)].decode("ascii")
+            assert t == f"WMT{wi + 1} SAMPLE:", f"Bad WMT sample edit title: {t!r}"
 
         itcm_insns = list(md.disasm(patched[0x6033776E - BASE_VA : 0x603377B6 - BASE_VA], 0x01024FD2))
         assert len(itcm_insns) >= 20, f"Unexpected instruction count in ITCM handler: {len(itcm_insns)}"

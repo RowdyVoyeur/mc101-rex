@@ -108,6 +108,245 @@ def build_sys_midi_table(image: bytes) -> bytes:
     return table
 
 
+def build_drum_pad_edit_blob(base_va: int, max_size: int) -> tuple[bytes, int]:
+    """Build the 11-section MC-707-depth Drum Pad Edit descriptor array, tables, and labels.
+
+    Layout starting at `base_va` (0x602D2B00):
+      - 11 x 12-byte section descriptors (132 bytes)
+      - 9 new ITEM_LIST_PRM tables (147 x 28 = 4116 bytes; PAD EDIT & EQ EDIT reuse stock)
+      - NUL-terminated deduplicated ASCII strings (section titles & short LCD labels)
+    """
+    # Section definitions: (title_or_stock_va, [(grp, rel_pid, label), ...] or stock_tbl_va, stock_count)
+    wmt_fields = [
+        (0x00, "Switch"),
+        (0x01, "Type"),
+        (0x02, "Bank"),
+        (0x03, "Wave L"),
+        (0x04, "Wave R"),
+        (0x05, "Gain"),
+        (0x0E, "Level"),
+        (0x0B, "Pan"),
+        (0x09, "Coarse"),
+        (0x0A, "Fine"),
+        (0x13, "Velo Lo"),
+        (0x14, "Velo Hi"),
+        (0x15, "Fade Lo"),
+        (0x16, "Fade Hi"),
+        (0x06, "FXM Sw"),
+        (0x07, "FXM Col"),
+        (0x08, "FXM Dpt"),
+        (0x0C, "Rnd Pan"),
+        (0x0D, "Alt Pan"),
+        (0x0F, "DlyMode"),
+        (0x10, "DlySync"),
+        (0x11, "DlyNote"),
+        (0x12, "DlyTime"),
+    ]
+
+    sections = [
+        # Sec 0: stock PAD EDIT (13 items)
+        ("stock", 0x602D1118, 13, 0x602C443C),
+        # Sec 1: expanded INST EDIT (kept at index 1 so 0x6004E1E8 Env Mode <-> TVA T4 sync stays intact)
+        (
+            "new",
+            0x602C4448,  # stock 'INST EDIT:'
+            [
+                (0xFA, 0x17, "Voice"),
+                (0xFA, 0x18, "Env Mode"),
+                (0xFA, 0x19, "WMT Velo"),
+                (0xFA, 0x11, "Inst Lvl"),
+                (0xFA, 0x12, "Src Key"),
+                (0xFA, 0x13, "FineTune"),
+                (0xFA, 0x14, "RndPitch"),
+                (0xFA, 0x15, "Rnd Pan"),
+                (0xFA, 0x16, "Alt Pan"),
+                (0xFA, 0x7E, "WaveSync"),
+            ],
+        ),
+        # Sec 2..5: WMT1..WMT4 (23 params each, grp=0xFA)
+        *[
+            (
+                "new",
+                f"WMT{w + 1} EDIT:",
+                [(0xFA, 0x1A + w * 0x17 + off, lbl) for off, lbl in wmt_fields],
+            )
+            for w in range(4)
+        ],
+        # Sec 6: TVF/TVA filter & velocity (8 params, grp=0xFA)
+        (
+            "new",
+            "TVF/TVA:  ",
+            [
+                (0xFA, 0x76, "Filter"),
+                (0xFA, 0x77, "Cutoff"),
+                (0xFA, 0x7A, "Reso"),
+                (0xFA, 0x78, "Cut VCrv"),
+                (0xFA, 0x79, "Cut VSns"),
+                (0xFA, 0x7B, "Res VSns"),
+                (0xFA, 0x7C, "Lvl VCrv"),
+                (0xFA, 0x7D, "Lvl VSns"),
+            ],
+        ),
+        # Sec 7: Pitch Env (14 params, grp=0x103)
+        (
+            "new",
+            "PITCH ENV:",
+            [
+                (0x103, 0x00, "Depth"),
+                (0x103, 0x01, "VeloSens"),
+                (0x103, 0x0D, "VeloCrv"),
+                (0x103, 0x02, "T1 Velo"),
+                (0x103, 0x03, "T4 Velo"),
+                (0x103, 0x04, "Time 1"),
+                (0x103, 0x05, "Time 2"),
+                (0x103, 0x06, "Time 3"),
+                (0x103, 0x07, "Time 4"),
+                (0x103, 0x08, "Level 0"),
+                (0x103, 0x09, "Level 1"),
+                (0x103, 0x0A, "Level 2"),
+                (0x103, 0x0B, "Level 3"),
+                (0x103, 0x0C, "Level 4"),
+            ],
+        ),
+        # Sec 8: TVF Env (14 params, grp=0x10C)
+        (
+            "new",
+            "TVF  ENV: ",
+            [
+                (0x10C, 0x00, "Depth"),
+                (0x10C, 0x01, "VeloCrv"),
+                (0x10C, 0x02, "VeloSens"),
+                (0x10C, 0x03, "T1 Velo"),
+                (0x10C, 0x04, "T4 Velo"),
+                (0x10C, 0x05, "Time 1"),
+                (0x10C, 0x06, "Time 2"),
+                (0x10C, 0x07, "Time 3"),
+                (0x10C, 0x08, "Time 4"),
+                (0x10C, 0x09, "Level 0"),
+                (0x10C, 0x0A, "Level 1"),
+                (0x10C, 0x0B, "Level 2"),
+                (0x10C, 0x0C, "Level 3"),
+                (0x10C, 0x0D, "Level 4"),
+            ],
+        ),
+        # Sec 9: TVA Env (9 params, grp=0x115)
+        (
+            "new",
+            "TVA  ENV: ",
+            [
+                (0x115, 0x00, "T1 Velo"),
+                (0x115, 0x01, "T4 Velo"),
+                (0x115, 0x02, "Time 1"),
+                (0x115, 0x03, "Time 2"),
+                (0x115, 0x04, "Time 3"),
+                (0x115, 0x05, "Time 4"),
+                (0x115, 0x06, "Level 1"),
+                (0x115, 0x07, "Level 2"),
+                (0x115, 0x08, "Level 3"),
+            ],
+        ),
+        # Sec 10: stock EQ EDIT (8 items)
+        ("stock", 0x602D12BC, 8, 0x602C4430),
+    ]
+
+    num_sections = len(sections)
+    desc_size = num_sections * 12
+    total_new_entries = sum(len(s[2]) for s in sections if s[0] == "new")
+    tables_offset = desc_size
+    strings_offset = tables_offset + total_new_entries * 28
+
+    str_pool = bytearray()
+    str_vas: dict[str, int] = {}
+
+    def intern(s: str) -> int:
+        if s not in str_vas:
+            str_vas[s] = base_va + strings_offset + len(str_pool)
+            str_pool.extend(s.encode("ascii") + b"\x00")
+        return str_vas[s]
+
+    descs = bytearray()
+    tables = bytearray()
+    for sec in sections:
+        if sec[0] == "stock":
+            _, tbl_va, cnt, title_va = sec
+            descs.extend(struct.pack("<3I", tbl_va, cnt, title_va))
+        else:
+            _, title, items = sec
+            title_va = title if isinstance(title, int) else intern(title)
+            tbl_va = base_va + tables_offset + len(tables)
+            descs.extend(struct.pack("<3I", tbl_va, len(items), title_va))
+            for grp, rel_pid, lbl in items:
+                lbl_va = intern(lbl)
+                tables.extend(struct.pack("<7I", grp, rel_pid, 0, 0x00030000, 0, lbl_va, 0))
+
+    blob = bytes(descs) + bytes(tables) + bytes(str_pool)
+    # Pad to 4-byte boundary
+    if len(blob) % 4:
+        blob += b"\x00" * (4 - (len(blob) % 4))
+    assert len(blob) <= max_size, f"DRUM-PAD-EDIT-TBL ({len(blob)}B) exceeds cave budget ({max_size}B)"
+    return blob, num_sections
+
+
+def build_pad_sound_menu_blob(base_va: int, max_size: int) -> tuple[bytes, int]:
+    """Build the 12-entry Drum Pad SOUND menu adding WMT1..4 WAVE loaders and WMT1..4 SMPL editors.
+
+    Each entry is 12 bytes: (label_ptr, screen_id, mode_param).
+    For screen_id 0x4A (WAVE FILE):
+      mode_param = 0 -> stock full-pad reset + load into WMT1
+      mode_param = 1..4 -> non-destructive load into WMT1..WMT4 (preserving other layers)
+    For screen_id 0x5D (SAMPLE EDIT):
+      mode_param = 1..4 -> edit User Sample assigned to WMT1..WMT4
+    """
+    entries_spec = [
+        (0x602C3FA0, 0x48, 3),  # PRESET (stock)
+        (0x602A8414, 0x4D, 2),  # PROJECT (stock)
+        (0x602C3F80, 0x4A, 0),  # WAVE FILE (stock WMT1 + pad init)
+        ("WMT1 WAVE", 0x4A, 1),  # Non-destructive WMT1 WAV import
+        ("WMT2 WAVE", 0x4A, 2),  # Non-destructive WMT2 WAV import
+        ("WMT3 WAVE", 0x4A, 3),  # Non-destructive WMT3 WAV import
+        ("WMT4 WAVE", 0x4A, 4),  # Non-destructive WMT4 WAV import
+        (0x602C3FA8, 0x34, 0),  # PAD EDIT (stock + Phase 1 11 sections)
+        ("WMT1 SMPL", 0x5D, 1),  # Sample Edit for WMT1 user sample
+        ("WMT2 SMPL", 0x5D, 2),  # Sample Edit for WMT2 user sample
+        ("WMT3 SMPL", 0x5D, 3),  # Sample Edit for WMT3 user sample
+        ("WMT4 SMPL", 0x5D, 4),  # Sample Edit for WMT4 user sample
+    ]
+    num_entries = len(entries_spec)
+    str_offset = num_entries * 12
+    str_pool = bytearray()
+    tbl = bytearray()
+    for lbl, screen_id, mode in entries_spec:
+        if isinstance(lbl, int):
+            lbl_va = lbl
+        else:
+            lbl_va = base_va + str_offset + len(str_pool)
+            str_pool.extend(lbl.encode("ascii") + b"\x00")
+        tbl.extend(struct.pack("<3I", lbl_va, screen_id, mode))
+    blob = bytes(tbl) + bytes(str_pool)
+    if len(blob) % 4:
+        blob += b"\x00" * (4 - (len(blob) % 4))
+    assert len(blob) <= max_size, f"PAD-SND-MENU-TBL ({len(blob)}B) exceeds budget ({max_size}B)"
+    return blob, num_entries
+
+
+def build_smpl_edit_descs_blob(base_va: int, max_size: int) -> bytes:
+    """Build 4 x 12-byte USER SAMPLE section descriptors ('WMT1 SAMPLE:'..'WMT4 SAMPLE:')."""
+    titles = [f"WMT{w + 1} SAMPLE:" for w in range(4)]
+    str_offset = 4 * 12
+    str_pool = bytearray()
+    descs = bytearray()
+    for t in titles:
+        t_va = base_va + str_offset + len(str_pool)
+        str_pool.extend(t.encode("ascii") + b"\x00")
+        # Reuse stock 8-entry USER SAMPLE table @ 0x602D7BE4
+        descs.extend(struct.pack("<3I", 0x602D7BE4, 8, t_va))
+    blob = bytes(descs) + bytes(str_pool)
+    if len(blob) % 4:
+        blob += b"\x00" * (4 - (len(blob) % 4))
+    assert len(blob) <= max_size, f"SMPL-EDIT-DESCS ({len(blob)}B) exceeds budget ({max_size}B)"
+    return blob
+
+
 def main() -> None:
     image = MC101_IMAGE_PATH.read_bytes()
     md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
@@ -477,6 +716,282 @@ itcm_knob_multi:
         return pad_nops(raw, length).hex()
 
     sys_midi_table = build_sys_midi_table(image)
+
+    # 3. Assemble Drum Pad Edit envelope clip-sync trampoline at 0x602D2A90
+    drum_env_tramp_va = 0x602D2A90
+    drum_env_ext = {
+        "fw_prm_id_init": 0x600996F8,
+        "fw_prm_set_clip": 0x60038540,
+    }
+    drum_env_asm = """
+    .thumb_func
+    .global tramp_pad_edit_env_clip
+tramp_pad_edit_env_clip:
+    push    {r4, r5, lr}
+    @ First execute stock SetClipIndex for Drum Inst (track + 0xFB)
+    bl      fw_prm_set_clip
+    @ Also set active clip index on Pitch Env (0x104), TVF Env (0x10D), TVA Env (0x116)
+    movw    r5, #0x104
+1:
+    ldr.w   r0, [r4, #0x9f8]
+    add     r1, r0, r5
+    movs    r2, #0
+    movs    r3, #0
+    add.w   r0, r4, #0x9f0
+    bl      fw_prm_id_init
+    ldrh.w  r0, [r4, #0x9fc]
+    sxth    r2, r0
+    add.w   r1, r4, #0x9f0
+    movw    r0, #0xadc4
+    movt    r0, #0x602c
+    bl      fw_prm_set_clip
+    adds    r5, r5, #9
+    cmp     r5, #0x116
+    ble     1b
+    pop     {r4, r5, pc}
+"""
+    drum_env_raw, drum_env_syms = assemble_thumb(drum_env_tramp_va, drum_env_asm, drum_env_ext)
+    drum_env_code = pad_nops(drum_env_raw, (len(drum_env_raw) + 3) & ~3)
+    assert drum_env_tramp_va + len(drum_env_code) <= 0x602D2B00, "DRUM-ENV-CLIP-HOOK overflows into 0x602D2B00"
+    print(f"[+] Drum Env clip trampoline @0x{drum_env_tramp_va:08X}: {len(drum_env_raw)} bytes")
+
+    drum_pad_edit_va = 0x602D2B00
+    drum_pad_edit_blob, drum_pad_sec_cnt = build_drum_pad_edit_blob(drum_pad_edit_va, 0x602D3D80 - drum_pad_edit_va)
+    print(f"[+] Drum Pad Edit blob @0x{drum_pad_edit_va:08X}: {len(drum_pad_edit_blob)} / {0x602D3D80 - drum_pad_edit_va} bytes ({drum_pad_sec_cnt} sections)")
+
+    # 4. Phase 2+3: 12-entry Drum Pad SOUND menu + WMT1..4 WAV loader + WMT1..4 SAMPLE EDIT + SAMPLE DELETE fix
+    pad_snd_menu_va = 0x602D3D80
+    pad_snd_menu_blob, pad_snd_menu_cnt = build_pad_sound_menu_blob(pad_snd_menu_va, 0x602D3E60 - pad_snd_menu_va)
+    print(f"[+] Drum Pad SOUND menu blob @0x{pad_snd_menu_va:08X}: {len(pad_snd_menu_blob)} bytes ({pad_snd_menu_cnt} items)")
+
+    smpl_edit_descs_va = 0x602D3E60
+    smpl_edit_descs_blob = build_smpl_edit_descs_blob(smpl_edit_descs_va, 0x602D3EC8 - smpl_edit_descs_va)
+    print(f"[+] WMT1..4 Sample Edit descs @0x{smpl_edit_descs_va:08X}: {len(smpl_edit_descs_blob)} bytes")
+
+    drum_p2_va = 0x602D3EC8
+    drum_p2_ext = {
+        "fw_bind_pad_wav": 0x600299A4,
+        "fw_mark_clip_dirty": 0x6001A1A2,
+        "fw_get_user_sample_id": 0x60054AF0,
+        "fw_get_sys_val": 0x6009BFCC,
+        "fw_pad_to_note": 0x6003744C,
+        "fw_get_inst_prm": 0x6009C064,
+        "fw_list_set_descs": 0x6006DB94,
+    }
+    drum_p2_asm = f"""
+    .thumb_func
+    .global tramp_snd_clear_wmt
+tramp_snd_clear_wmt:
+    movw    r1, #0x2af8
+    movt    r1, #0x602d
+    movs    r2, #0
+    str     r2, [r1, #0]
+    str     r2, [r1, #4]
+    ldr.w   r0, [r5, #0x9f0]
+    bx      lr
+
+    .balign 2
+    .thumb_func
+    .global tramp_pad_snd_enter
+tramp_pad_snd_enter:
+    ldrd    r4, r5, [r0, #4]
+    movw    r1, #0x2af8
+    movt    r1, #0x602d
+    cmp     r4, #0x4a
+    it      eq
+    streq   r5, [r1, #4]
+    cmp     r4, #0x5d
+    it      eq
+    streq   r5, [r1, #0]
+    bx      lr
+
+    .balign 2
+    .thumb_func
+    .global tramp_bind_pad_wav_wmt
+tramp_bind_pad_wav_wmt:
+    movw    ip, #0x2afc
+    movt    ip, #0x602d
+    ldr.w   ip, [ip]
+    cmp.w   ip, #0
+    beq     9f
+    cmp.w   ip, #4
+    bhi     9f
+    push    {{r4, r5, r6, r7, lr}}
+    mov     r4, r0
+    mov     r5, r1
+    mov     r6, r2
+    mov     r7, r3
+    sub.w   ip, ip, #1
+    @ Compute DrumInst ptr = DrumInstTable[track] + clip * 0x4A40 + pad * 0xD8
+    movw    r0, #0x0774
+    movt    r0, #0x6021
+    ldr.w   r0, [r0, r4, lsl #2]
+    movw    r1, #0x4a40
+    muls    r1, r5, r1
+    add     r0, r0, r1
+    movs    r1, #0xd8
+    muls    r1, r6, r1
+    add     r0, r0, r1
+    @ wmt_ptr = DrumInst + 0x1C + wmt_idx * 0x1C
+    adds    r0, r0, #0x1c
+    movs    r1, #0x1c
+    mla     r0, ip, r1, r0
+    @ Write WMTx: SW=1, GTYPE=2 (SAMP), GID=0, WAV_NUM_L=sample_id+1, WAV_NUM_R=0
+    movs    r1, #1
+    strb    r1, [r0, #0]
+    movs    r1, #2
+    strb    r1, [r0, #1]
+    movs    r1, #0
+    strh    r1, [r0, #2]
+    adds    r2, r7, #1
+    strh    r2, [r0, #4]
+    strh    r1, [r0, #6]
+    @ Ensure audible defaults if this layer was previously zeroed
+    ldrb    r2, [r0, #0x11]
+    cbnz    r2, 2f
+    movs    r2, #127
+    strb    r2, [r0, #0x11]
+2:
+    ldrh    r2, [r0, #0x18]
+    cbnz    r2, 3f
+    movw    r2, #0x7f01
+    strh    r2, [r0, #0x18]
+3:
+    @ Ensure KitPad.InstNum != 0 (if blank pad, enable InstNum=1; preserve existing pads)
+    movw    r0, #0x0754
+    movt    r0, #0x6021
+    ldr.w   r0, [r0, r4, lsl #2]
+    movw    r1, #0x0d00
+    muls    r1, r5, r1
+    add     r0, r0, r1
+    movs    r1, #20
+    muls    r1, r6, r1
+    adds    r1, r1, #0xa0
+    ldrh    r2, [r0, r1]
+    cbnz    r2, 4f
+    movs    r2, #1
+    strh    r2, [r0, r1]
+4:
+    @ Mark clip dirty so edits save cleanly (do NOT call 0x6001A1B6 which resets KitPad/EQ!)
+    mov     r0, r4
+    mov     r1, r5
+    bl      fw_mark_clip_dirty
+    pop     {{r4, r5, r6, r7, pc}}
+9:
+    b.w     fw_bind_pad_wav
+
+    .balign 2
+    .thumb_func
+    .global tramp_sample_del_wmt_scan
+tramp_sample_del_wmt_scan:
+    ldrb    r3, [r2, #0x1d]
+    cmp     r3, #2
+    bne     3f
+    ldrsh.w r0, [r2, #0x20]
+    cmp     r0, #0
+    ble     1f
+    cmp.w   r0, #0x1f4
+    bgt     1f
+    add     r0, r0, r6
+    strb.w  fp, [r0, #0xa03]
+1:
+    ldrsh.w r0, [r2, #0x22]
+    cmp     r0, #0
+    ble     3f
+    cmp.w   r0, #0x1f4
+    bgt     3f
+    add     r0, r0, r6
+    strb.w  fp, [r0, #0xa03]
+3:
+    bx      lr
+
+    .balign 2
+    .thumb_func
+    .global tramp_smpl_edit_get_id
+tramp_smpl_edit_get_id:
+    @ Input: r0=clip, r1=track, r2=0, r3=0
+    movw    ip, #0x2af8
+    movt    ip, #0x602d
+    ldr.w   ip, [ip]
+    cmp.w   ip, #2
+    blo     8f
+    cmp.w   ip, #4
+    bhi     8f
+    push    {{r4, r5, r6, r7, r8, lr}}
+    sub     sp, #8
+    mov     r7, r0              @ r7 = clip
+    mov     r5, r1              @ r5 = track
+    sub.w   r0, ip, #1          @ wmt_idx = 1..3
+    movs    r1, #0x17
+    mul     r8, r0, r1          @ r8 = wmt_idx * 23 (0x17, 0x2E, 0x45)
+    @ Fetch current drum pad index (same as 0x60054B7A..0x60054B88)
+    movs    r0, #0x63
+    bl      fw_get_sys_val
+    mov     r1, r0
+    movw    r0, #0x4430
+    movt    r0, #0x60a9
+    bl      fw_pad_to_note
+    sub.w   r6, r0, #0x15       @ r6 = pad_idx
+    mov.w   r4, #-1
+    @ Query WMT[wmt_idx].WAV_GTYPE (0x8E2 + r8)
+    movw    r3, #0x8e2
+    add     r3, r3, r8
+    movs    r2, #0xfb
+    mov     r1, r7
+    mov     r0, r5
+    str     r6, [sp]
+    bl      fw_get_inst_prm
+    cmp     r0, #1              @ SAMP?
+    bne     7f
+    @ Query WMT[wmt_idx].WAV_NUM_L (0x8E4 + r8)
+    movw    r3, #0x8e4
+    add     r3, r3, r8
+    movs    r2, #0xfb
+    mov     r1, r7
+    mov     r0, r5
+    str     r6, [sp]
+    bl      fw_get_inst_prm
+    cmp     r0, #0
+    it      gt
+    movgt   r4, r0
+7:
+    mov     r0, r4
+    add     sp, #8
+    pop     {{r4, r5, r6, r7, r8, pc}}
+8:
+    b.w     fw_get_user_sample_id
+
+    .balign 2
+    .thumb_func
+    .global tramp_smpl_edit_hdr
+tramp_smpl_edit_hdr:
+    @ Hooked at 0x6007C468: r0=widget, r1=0x6021EBC8 (stock), r2=1
+    movw    ip, #0x2af8
+    movt    ip, #0x602d
+    ldr.w   ip, [ip]
+    cmp.w   ip, #1
+    blo     1f
+    cmp.w   ip, #4
+    bhi     1f
+    sub.w   ip, ip, #1
+    movs    r3, #12
+    movw    r1, #0x{smpl_edit_descs_va & 0xFFFF:04x}
+    movt    r1, #0x{(smpl_edit_descs_va >> 16) & 0xFFFF:04x}
+    mla     r1, ip, r3, r1
+1:
+    b.w     fw_list_set_descs
+"""
+    drum_p2_raw, drum_p2_syms = assemble_thumb(drum_p2_va, drum_p2_asm, drum_p2_ext)
+    drum_p2_code = pad_nops(drum_p2_raw, (len(drum_p2_raw) + 3) & ~3)
+    assert drum_p2_va + len(drum_p2_code) <= 0x602D40E0, "DRUM-PHASE2-HOOKS exceeds cave end 0x602D40E0"
+    print(f"[+] Drum Phase 2 hooks @0x{drum_p2_va:08X}: {len(drum_p2_raw)} bytes (free tail: {0x602D40E0 - (drum_p2_va + len(drum_p2_code))} B)")
+    for k, v in drum_p2_syms.items():
+        if not k.startswith("$"):
+            print(f"    {k:28s} = 0x{v:08X}")
+
+    all_ext.update(drum_env_syms)
+    all_ext.update(drum_p2_syms)
+    all_ext["sample_del_wmt_next"] = 0x600877F4
 
     patch_defs = [
         # Cave & Tables
@@ -943,6 +1458,227 @@ itcm_knob_multi:
             "ui",
             "table",
             "LCD splash screen line 1: 'Roland MC-101   ' -> 'Roland MC-107   '.",
+        ),
+        # Phase 1: MC-707-Depth Drum Pad Editing (11 sections: PAD, INST, WMT1..4, TVF/TVA, PITCH/TVF/TVA ENV, EQ)
+        (
+            "DRUM-ENV-CLIP-HOOK",
+            drum_env_tramp_va,
+            len(drum_env_code),
+            drum_env_code.hex(),
+            "drum",
+            "code",
+            "Trampoline extending Pad Edit OnCreate clip registration to Pitch Env (trk+0x104), TVF Env (trk+0x10D), and TVA Env (trk+0x116).",
+        ),
+        (
+            "DRUM-PAD-EDIT-TBL",
+            drum_pad_edit_va,
+            len(drum_pad_edit_blob),
+            drum_pad_edit_blob.hex(),
+            "drum",
+            "table",
+            "11-section MC-707-depth Drum Pad Edit descriptor array, 147 new ITEM_LIST_PRM entries (INST GEN, WMT1..4, TVF/TVA, Pitch/TVF/TVA Env), and LCD labels.",
+        ),
+        (
+            "PAD-EDIT-ENV-CLIP",
+            0x6004E108,
+            4,
+            asm_at(0x6004E108, "bl tramp_pad_edit_env_clip", 4),
+            "drum",
+            "hook",
+            "Pad Edit OnCreate: hook SetClipIndex(track+0xFB) to also register active clip on Pitch/TVF/TVA Env providers.",
+        ),
+        (
+            "PAD-EDIT-SEC-CNT",
+            0x6004E12A,
+            2,
+            struct.pack("<H", 0x2200 | drum_pad_sec_cnt).hex(),
+            "drum",
+            "code",
+            "Pad Edit OnCreate: widen section count passed to 0x6006DB94 from 3 to 11.",
+        ),
+        (
+            "PAD-EDIT-SEC-PTR",
+            0x6004E1A8,
+            4,
+            struct.pack("<I", drum_pad_edit_va).hex(),
+            "drum",
+            "table",
+            "Pad Edit OnCreate: repoint section descriptor array literal from 0x6021E2EC to 0x602D2B00.",
+        ),
+        (
+            "WMT4-FMT-BUGFIX",
+            0x6008BB0A,
+            4,
+            "424600bf",
+            "drum",
+            "code",
+            "DrumInst::FormatVal (WMT4 Wave Group ID rel_pid 0x61): fix stock mov.w r2, #-1 bug -> mov r2, r8; nop (pass pad_idx like WMT1..3).",
+        ),
+        (
+            "WMT4-SET-BUGFIX",
+            0x6008BE04,
+            4,
+            "1a4600bf",
+            "drum",
+            "code",
+            "DrumInst::SetVal (WMT4 Wave Group ID rel_pid 0x61): fix stock mov.w r2, #-1 bug -> mov r2, r3; nop (pass pad_idx like WMT1..3).",
+        ),
+        # Phase 2+3: Direct SD WAVE FILE import & SAMPLE EDIT for WMT1..4 + SAMPLE DELETE WMT1..4 audit fix
+        (
+            "PAD-SND-MENU-TBL",
+            pad_snd_menu_va,
+            len(pad_snd_menu_blob),
+            pad_snd_menu_blob.hex(),
+            "drum",
+            "table",
+            "12-entry Drum Pad SOUND menu adding non-destructive WMT1..4 WAVE loaders and WMT1..4 SMPL editors.",
+        ),
+        (
+            "SMPL-EDIT-DESCS",
+            smpl_edit_descs_va,
+            len(smpl_edit_descs_blob),
+            smpl_edit_descs_blob.hex(),
+            "drum",
+            "table",
+            "4 USER SAMPLE section descriptors ('WMT1 SAMPLE:'..'WMT4 SAMPLE:') reusing stock 8-entry table 0x602D7BE4.",
+        ),
+        (
+            "DRUM-PHASE2-HOOKS",
+            drum_p2_va,
+            len(drum_p2_code),
+            drum_p2_code.hex(),
+            "drum",
+            "code",
+            "Phase 2+3 trampolines: SOUND menu WMT target capture/clear, non-destructive WMT1..4 WAV binder, SAMPLE DELETE WMT1..4 L/R scanner, and WMT1..4 Sample Edit resolver/header.",
+        ),
+        (
+            "PAD-SND-HDR-SPLIT",
+            0x6006A376,
+            2,
+            "0728",
+            "drum",
+            "code",
+            "Drum Pad SOUND menu header split: cmp r0, #3 -> #7 so PRESET/PROJECT/WAVE FILE/WMT1..4 WAVE show BROWSER and PAD EDIT/WMT1..4 SMPL show EDIT.",
+        ),
+        (
+            "PAD-SND-MENU-PTR1",
+            0x6006A430,
+            4,
+            struct.pack("<I", pad_snd_menu_va).hex(),
+            "drum",
+            "table",
+            "Drum Pad SOUND menu draw literal: repoint 0x6021C168 -> 0x602D3D80.",
+        ),
+        (
+            "PAD-SND-MENU-PTR2",
+            0x6006A648,
+            4,
+            struct.pack("<I", pad_snd_menu_va).hex(),
+            "drum",
+            "table",
+            "Drum Pad SOUND menu Enter literal: repoint 0x6021C168 -> 0x602D3D80.",
+        ),
+        (
+            "PAD-SND-CNT-DIAL",
+            0x6006A46C,
+            24,
+            asm_at(
+                0x6006A46C,
+                "cmp.w ip, #1\nit eq\nmoveq r0, #5\ncmp.w ip, #2\nit eq\nmoveq r0, #2\ncmp.w ip, #3\nit eq\nmoveq r0, #12",
+                24,
+            ),
+            "drum",
+            "code",
+            "Drum Pad SOUND menu dial scroll bound: widen mode 3 (Drum Pad) item count from 5 to 12 while keeping Drum Kit = 5 and Looper = 2.",
+        ),
+        (
+            "PAD-SND-CNT-LEFT",
+            0x6006A4FA,
+            24,
+            asm_at(
+                0x6006A4FA,
+                "cmp.w ip, #1\nit eq\nmoveq r1, #5\ncmp.w ip, #2\nit eq\nmoveq r1, #2\ncmp.w ip, #3\nit eq\nmoveq r1, #12",
+                24,
+            ),
+            "drum",
+            "code",
+            "Drum Pad SOUND menu LEFT button bound: widen mode 3 (Drum Pad) item count from 5 to 12.",
+        ),
+        (
+            "PAD-SND-CNT-RIGHT",
+            0x6006A546,
+            24,
+            asm_at(
+                0x6006A546,
+                "cmp.w ip, #1\nit eq\nmoveq r1, #5\ncmp.w ip, #2\nit eq\nmoveq r1, #2\ncmp.w ip, #3\nit eq\nmoveq r1, #12",
+                24,
+            ),
+            "drum",
+            "code",
+            "Drum Pad SOUND menu RIGHT button bound: widen mode 3 (Drum Pad) item count from 5 to 12.",
+        ),
+        (
+            "PAD-SND-CLR-HOOK",
+            0x6006A574,
+            4,
+            asm_at(0x6006A574, "bl tramp_snd_clear_wmt", 4),
+            "drum",
+            "hook",
+            "SOUND menu Enter handler entry: clear g_pad_smpl_wmt_target (0x602D2AF8) and g_pad_wav_wmt_target (0x602D2AFC) before track-type dispatch.",
+        ),
+        (
+            "PAD-SND-ENTER-HOOK",
+            0x6006A5E0,
+            4,
+            asm_at(0x6006A5E0, "bl tramp_pad_snd_enter", 4),
+            "drum",
+            "hook",
+            "Drum Pad SOUND menu Enter: record target WMT slot when opening Screen 0x4A (WAVE FILE) or Screen 0x5D (SAMPLE EDIT).",
+        ),
+        (
+            "PAD-WAV-BIND-WMT",
+            0x6002132E,
+            4,
+            asm_at(0x6002132E, "bl tramp_bind_pad_wav_wmt", 4),
+            "drum",
+            "hook",
+            "Async cmd 4 (WAVE FILE import on Drum track): route non-destructive WMT1..4 imports without resetting other pad layers.",
+        ),
+        (
+            "SAMPLE-DEL-WMT-FIX",
+            0x600877D6,
+            30,
+            asm_at(0x600877D6, "bl tramp_sample_del_wmt_scan\nb sample_del_wmt_next", 30),
+            "drum",
+            "hook",
+            "SAMPLE DELETE used-sample scanner: fix stock bug that always read WMT1.WAV_NUM_L instead of WMT[r5].WAV_NUM_L/R across layers 1..4.",
+        ),
+        (
+            "SMPL-EDIT-GET1",
+            0x6007C3BE,
+            4,
+            asm_at(0x6007C3BE, "bl tramp_smpl_edit_get_id", 4),
+            "drum",
+            "hook",
+            "Screen 0x5D (SAMPLE EDIT) OnCreate: fetch User Sample ID from targeted WMT1..4 layer (fallback stock for Tone/WMT1).",
+        ),
+        (
+            "SMPL-EDIT-GET2",
+            0x6007C504,
+            4,
+            asm_at(0x6007C504, "bl tramp_smpl_edit_get_id", 4),
+            "drum",
+            "hook",
+            "Screen 0x5D (SAMPLE EDIT) OnPadSwitch: fetch User Sample ID from targeted WMT1..4 layer.",
+        ),
+        (
+            "SMPL-EDIT-HDR",
+            0x6007C468,
+            4,
+            asm_at(0x6007C468, "bl tramp_smpl_edit_hdr", 4),
+            "drum",
+            "hook",
+            "Screen 0x5D (SAMPLE EDIT) OnCreate: show 'WMT1 SAMPLE:'..'WMT4 SAMPLE:' header when editing a Drum Pad WMT layer.",
         ),
     ]
 
