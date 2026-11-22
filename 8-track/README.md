@@ -31,12 +31,13 @@ Both `RPG69_C0A_up.bin` and `RPG69_C1A_up.bin` must be flashed to the device (co
 
 - [`build.py`](build.py) — top-level build and verification driver
 - [`manifest/sites.json`](manifest/sites.json) — Core 0 patch-site manifest
+- [`src/sample_chop.c`](src/sample_chop.c) — freestanding Cortex-M7 C module for `SMPL CHOP` (Screen `0x68`)
 - [`tools/`](tools/) — final patch, manifest generation, and verification scripts (`gen_manifest.py`, `patch_image.py`, `verify_patched_image.py`, `patch_c1a_dsp.py`)
 - [`investigation/`](investigation/) — scouting and reverse-engineering scripts used during development (`c1img.py`, `scan_c1_*.py`, `scout_strings.py`)
 
 ## Status
 
-All 52 active Core 0 patches are implemented in [`manifest/sites.json`](manifest/sites.json) and generated reproducibly by [`tools/gen_manifest.py`](tools/gen_manifest.py), and the Core 1 DSP patch is implemented in [`tools/patch_c1a_dsp.py`](tools/patch_c1a_dsp.py):
+All 83 active Core 0 patches are implemented in [`manifest/sites.json`](manifest/sites.json) and generated reproducibly by [`tools/gen_manifest.py`](tools/gen_manifest.py), and the Core 1 DSP patch is implemented in [`tools/patch_c1a_dsp.py`](tools/patch_c1a_dsp.py):
 
 - **Track selection toggle & bank switching (`UI-03`, `UI-DIRTY-FDR`, `SEL-03`, `CAVE-01`)**: Pressing the already-selected `SEL1..SEL4` button toggles between Bank A (Tracks 1–4) and Bank B (Tracks 5–8); pressing a different `SEL1..SEL4` button selects that slot within the active bank (`CurTrack & 4`). Updates `0x602D27FC` and `0x61800200` atomically. `UI-DIRTY-FDR` at `0x60035E74` asserts UI dirty bit 4 (`0x10`) so `UpdateFaderRgbLeds` immediately renders the selected bank. Holding `[SHIFT]` (`button 0`) + `[SEL1..4]` enters the `EDIT` menu (`Screen 0x36`) for that track, and pressing `[SHIFT]` + the same track button again while in `EDIT` mode toggles between the `EDIT` menu for the printed track (`1..4`) and the `+4` track (`5..8`).
 - **Volume faders & `MULTI` knobs (`FDR-ITCM-TBB`, `FDR-ITCM-CODE`, `KNOB-ITCM-MULTI`, `KNOB-UI-MULTI1`, `KNOB-UI-MULTI2`)**: Replaces the 4 unrolled fader handlers in ITCM (`0x01024FD2..0x01025050`) with a unified bank-aware fader handler (`0x3F + track * 3`) and bank-switches `C1..C4` in `MULTI` knob mode so faders 1–4 and `C1..C4` control Tracks 5–8 whenever Track 5, 6, 7, or 8 is selected. `KNOB-UI-MULTI1` (`0x60036A16`) and `KNOB-UI-MULTI2` (`0x60036B6A`) hook strictly before the `Single` knob-mode branch targets (`0x60036A1A`, `0x60036B6E`) so `System > Knob Trk = Single` works cleanly across all 8 tracks.
@@ -44,6 +45,93 @@ All 52 active Core 0 patches are implemented in [`manifest/sites.json`](manifest
 - **Menu items & External MIDI RX (`MENU-MIDI-TBL`, `MENU-MIDI-DESC`, `MIDI-RX-TRK-CNT`, `MIDI-CH-ALLOFF`, `PRM-*`, + Core 1 `patch_c1a_dsp.py`)**: Extends `SYSTEM(MIDI)` with `Track Ch5..8` (`23` items total), widens the ITCM incoming MIDI RX track-channel scan (`0x01010D1A`, `cmp r4, #4` → `#8`) and channel-change All-Sound-Off check (`0x6003D674`, `0xDB..0xE2`) so Tracks 5–8 receive external MIDI cleanly (hardware verified across all 8 channels), and unlocks `TRK1..TRK8` / `TRACK1..TRACK7` across `RECORDING: RecSource`, `SCATTER EDIT: Position`, `SCAT EDIT: DT1 Pos`, and `TRACK(GEN): Insert`. Core 1 ([`tools/patch_c1a_dsp.py`](tools/patch_c1a_dsp.py)) also lifts the `cmp rX, #5` → `cmp rX, #9` routing clamps in `RecSource` (`0x6101EDA6`) and `Scatter Position / DT1 Pos` (`0x6101F04E`) so Tracks 5–8 route individually instead of falling back to `MIXOUT` (hardware verified).
 - **20-Channel USB `Vendor` Audio Output (`USB-DESC-*`, `USB-INIT-*`, `USB-IF*`, + Core 1 `patch_c1a_dsp.py`)**: Widens High-Speed `Vendor` USB Audio Streaming IN (Interface 2, AltSetting 1) to 20 channels (`wMaxPacketSize = 524`) and configures the USB bridge (`0x40080900`) channel/FIFO/burst registers for 20 channels on bus reset and interface selection. **Status note:** the ESC2 crossbar sites formerly listed here (`USB-ROUTER-INIT`, `AUDIO-DAC-CLEAN`, `AUDIO-START-HOOK`) were **removed** after the Attempt 8 DAC regression (see §4); the `CAVE-02` cave (`0x602D2B00`, 256 B) is free again after the Attempt 11 probe cleanup. Per-track stems for USB channels 11–18 (Tracks 5–8, `0x258C..0x2593`) and silenced channels 19–20 (`0x25A2..0x25A3`) are provided by **Core 1** ([`tools/patch_c1a_dsp.py`](tools/patch_c1a_dsp.py)), hardware verified across all 8 tracks.
 - **8-Track Project (`.prj`) Load, Save, & Import (`PRJ-LOAD-PRESERVE`, `PRJ-POST-LOAD`)**: Preserves tracks 5–8 during project load by bypassing the stock wipe loop at `0x6005B422`, so the `.prj` deserializer restores its own stored clips, allocations, volumes, and levels for the upper bank, and then initializes the upper bank on the universal load-completion exit `PRJ-POST-LOAD` (`0x60046424` → `tramp_prj_load_init` at `0x602D26FE`): resets the active-track variables (`0x602D27FC`, `0x61800200`), sets `tone_level_cache[0..7] = 100` (`0x200199F8`), and pushes unity `255` to Area 2 fader params `0x4B..0x54` in the UI shadow via `fw_set_param` **and** to the Sound Engine DSP mixer queue via `fw_set_dsp_param`. **Runtime status**: upper-4 tracks are audible straight after a cold boot into a project, with no fader touch (hardware verified). This hook is **load-bearing, not dead code**: deleting it in the Attempt 9 cleanup made the zero-volume start of tracks 5–8 return on hardware, so it is restored verbatim (§2, Attempts 9 and 10). `PRJ-POST-LOAD` overwrites the *epilogue* of the enclosing project-load function, so `tramp_prj_load_init` is a **tail call**: its `sub sp, sp, #8` + `add sp, sp, #0x30` reproduce the stock `add sp, sp, #0x28`, and its `pop.w {r4-r10, pc}` is byte-identical to the stock epilogue (`0ab0bde8f087` stock → `0cb0bde8f087` in the cave). `tools/verify_patched_image.py` asserts that contract from both sides; adding pushes to the routine or changing either `sp` constant faults. `PRJ-LOAD-INIT` (`0x6005B452`) stays deleted — the routine never returns there, and `0x6005B452..0x6005BEA0` is asserted stock. Consequence to keep in mind: a project that stores tracks 5–8 at very low volume **is** raised to unity 255 on load, and the remembered bank word (`0x602D27FC`) is reset to `0` (bank A) by the load path. Verified 100% 8-track native in the stock MC-101 `.prj` serializer/deserializer (`0x6003E500..0x600466F0`) and project track/clip importer (`0x6008E4B4..0x6008EDFC`).
+- **MC-707-Depth Drum Pad Edit (`DRUM-ENV-CLIP-HOOK`, `DRUM-PAD-EDIT-TBL`, `PAD-EDIT-*`, `WMT4-*-BUGFIX`)**: Expands `SHIFT + PAD → PAD EDIT` from 3 sections to **11 sections** (147 newly exposed Zen-Core parameters across `INST EDIT`, `WMT1–WMT4`, `TVF/TVA`, `PITCH ENV`, `TVF ENV`, `TVA ENV`, and stock `PAD EDIT` / `EQ EDIT`), syncs clip context for the 3 envelope parameter groups, and fixes two stock Roland bugs on `WMT4` (`WMT4-FMT-BUGFIX` and `WMT4-SET-BUGFIX`). Hardware verified.
+- **Per-Layer WAV Loading & Sample Editing (`PAD-SND-*`, `DRUM-PHASE2-HOOKS`, `PAD-WAV-BIND-WMT`, `SMPL-EDIT-*`, `SAMPLE-DEL-WMT-FIX`)**: Expands the `SHIFT + PAD` Drum Pad Sound Menu from 5 to **13 items**, adding non-destructive **`WMT1 WAVE`–`WMT4 WAVE`** loaders (preserving existing layers on the pad), **`WMT1 SMPL`–`WMT4 SMPL`** Sample Edit shortcuts, and updating Sample Delete reference scanning across all 4 WMT layers so samples loaded into `WMT2`–`WMT4` are never falsely marked unused. Hardware verified.
+- **Sample Chop, 16×2 LCD Waveform, & Pad Assign (`SCR-*`, `CHOP-CODE`, `CHOP-SLICE`, `CHOP-DETECT`, `CHOP-PAD-AUDIO-GATE`, [`src/sample_chop.c`](src/sample_chop.c))**: Registers custom **Screen `0x68` (`SMPL CHOP`)** in the relocated 105-entry screen table with live 16×2 CGRAM waveform & slice/transient markers (`1x`–`32x` zoom), equal-step (`1/4/8/16/32`), auto transient detection, manual slice add/delete/nudge, isolated real-time slice audition on Pads 1–16 (`SHIFT+Pad` for 17–32), and auto/manual pad assignment that writes real truncated User Samples into external Wave RAM and syncs to Core 1 DSP. Hardware verified.
+
+---
+
+## User Guide: Drum Pad Deep Edit, WMT1–4 Sample Tools, & Sample Chop
+
+All features below are accessed on a **Drum Track** in **NOTE** mode by holding **`SHIFT` + tapping a Pad** to open the expanded 13-item Drum Pad Sound Menu:
+
+`PRESET` · `PROJECT` · `WAVE FILE` · **`WMT1 WAVE`–`WMT4 WAVE`** · **`PAD EDIT`** · **`WMT1 SMPL`–`WMT4 SMPL`** · **`SMPL CHOP`**
+
+### 1. Expanded Drum Pad Edit (`SHIFT + PAD → PAD EDIT`)
+
+Stock MC-101 only exposes 3 sections in `PAD EDIT` (`PAD EDIT`, a 3-item `INST EDIT`, and `EQ EDIT`). This patch unlocks **11 sections** matching MC-707 drum instrument depth (use `SHIFT + VALUE` dial to jump quickly between sections):
+
+1. **`PAD EDIT:`** *(stock, 13 params)* — Pad Level, Pan, Coarse/Fine Tune, Mute Group, Reverb/Chorus/Delay Sends, Comp/EQ Sw, Output Assign, etc.
+2. **`INST EDIT:`** *(expanded, 10 params)* — Voice Assign, Env Mode, WMT Velo, Inst Lvl, Src Key, FineTune, RndPitch, Rnd Pan, Alt Pan, WaveSync.
+3. **`WMT1 EDIT:` – `WMT4 EDIT:`** *(4 sections × 23 params each)* — Full per-layer control for all 4 Wave Multi-Tone layers: Switch, Type (`INT`/`SAMP`), Bank, Wave L, Wave R, Level, Pan, Coarse/Fine Tune, Gain, Velo Lo/Hi, Fade Lo/Hi, FXM Sw/Col/Dpt, Rnd/Alt Pan, Delay Mode/Sync/Note/Time.
+4. **`TVF/TVA:`** *(8 params)* — Filter Type, Cutoff, Resonance, Cutoff Velo Curve/Sens, Reso Velo Sens, Level Velo Curve/Sens.
+5. **`PITCH ENV:`** *(14 params)* — Depth, Velo Sens/Curve, T1/T4 Velo, Time 1–4, Level 0–4.
+6. **`TVF ENV:`** *(14 params)* — Depth, Velo Sens/Curve, T1/T4 Velo, Time 1–4, Level 0–4.
+7. **`TVA ENV:`** *(14 params)* — T1/T4 Velo, Time 1–4, Level 1–3, and envelope shape controls.
+8. **`EQ EDIT:`** *(stock, 8 params)* — Pad 3-band EQ.
+
+### 2. Per-Layer WAV Loading & Sample Edit (`WMT1–4 WAVE` & `WMT1–4 SMPL`)
+
+- **`WAVE FILE`** *(stock behavior)*: Resets the entire pad (clears `WMT2`–`WMT4`, resets pitch/filter/EQ, renames the pad) and loads the chosen WAV into `WMT1`.
+- **`WMT1 WAVE` – `WMT4 WAVE`**: Loads a WAV file **non-destructively** into that specific WMT layer (`WMT1`–`WMT4`), keeping all other layers, preset waves, filter/envelope settings, and pad settings intact — ideal for stacking drum hits (e.g., sub + click + acoustic snare + texture) on a single pad.
+- **`WMT1 SMPL` – `WMT4 SMPL`**: Opens the stock Sample Edit screen (Start/End/Loop/Gain/Normalize/etc.) directly targeting the User Sample assigned to `WMT1`, `WMT2`, `WMT3`, or `WMT4`.
+- **Safe Sample Delete:** The firmware's unused-sample scanner checks all 4 WMT layers (`WMT1`–`WMT4`), so samples loaded into `WMT2`–`WMT4` are properly protected.
+
+### 3. Sample Chop & Pad Assign (`SHIFT + PAD → SMPL CHOP`)
+
+`SMPL CHOP` lets you inspect any User Sample on a Drum Track pad as a live waveform on the 16×2 LCD, slice it into up to **32 chops** (by equal steps, automatic transient detection, or manual placement), audition every slice cleanly in isolation on the pads, and export slices as real standalone User Samples assigned to your Drum Kit pads (which save and reload with your project).
+
+#### Opening & Reading the Display
+1. On a **Drum Track** in **NOTE** mode, hold **`SHIFT` + tap the pad** containing your User Sample, scroll to **`SMPL CHOP`**, and press **`VALUE`**.
+2. On open, `SMPL CHOP` automatically finds the first WMT layer (`WMT1`–`WMT4`) holding a User Sample, starts with **4 equal slices (`>STEP:04`)**, and isolates audio:
+   - Other pads (`Pads 1–16`) are gated so tapping them only auditions slices instead of triggering existing kit sounds.
+   - Other WMT layers/presets on the source pad are temporarily muted on Core 1 DSP and automatically restored on `EXIT`.
+3. **16×2 LCD Layout:**
+   - **Row 1 (top):** Active mode (`>` prefix) and parameters, or temporary status banners (`SLICE ADDED!`, `DONE! 08 PADS OK`, etc.).
+   - **Row 2 (bottom):** 16-column live **waveform** of the current zoom window:
+     - **Vertical bars** (6 heights): Audio peak amplitude per column.
+     - **Solid flat top cap + vertical line:** Active marker (currently selected slice start, or free cursor in `>ADD`).
+     - **Small top tick + stem:** All other slice/transient markers visible in the window.
+
+#### Global Controls (Work in Every Mode)
+- **Short-press `VALUE`:** Cycles through the 7 modes:  
+  `>STEP` → `>AUTO` → `>M01` (Move) → `>ADD` → `>Z` (Zoom) → `>ASGN` → `>SRC`
+- **Turn `VALUE` dial:** Adjusts the active mode's primary parameter or moves the marker/cursor.
+- **`SHIFT + VALUE` press:** Executes the active mode's action (Delete slice in `Mxx`, Insert slice in `ADD`, Re-detect in `AUTO`, Commit in `ASGN`).
+- **`SHIFT + VALUE` dial:** Secondary control (Quick Zoom in `Mxx`/`ADD`, fine sensitivity `±1` in `AUTO`, target layer `W1`–`W4` in `ASGN`).
+- **Tap Pads 1–16** *(in `STEP`/`AUTO`/`Mxx`/`Z`)*: Selects and auditions slices `1–16` live; hold **`SHIFT` + Pad 1–16** for slices `17–32`. Releasing the pad stops playback.
+- **`EXIT`:** Restores the source sample's original Start/End and original WMT layer switches, and exits (any slices already committed in `>ASGN` remain permanently assigned).
+
+#### The 7 Modes
+1. **`>STEP` (Equal-Step Chop)** — e.g. `>STEP:16  S01/16`
+   - Turn `VALUE` dial to divide the sample evenly into **`01`, `04`, `08`, `16`, or `32` slices** across `[orig_start..orig_end]`. Tap Pads 1–16 (`SHIFT+Pad` for 17–32) to preview.
+2. **`>AUTO` (Auto Transient Detection)** — e.g. `>AUTO:50  N:12`
+   - Scans the sample's 128-bin peak envelope and places slice markers on sharp attacks/transients (up to 32 slices).
+   - Turn `VALUE` dial to adjust sensitivity **`05`–`95`** in steps of `5` (`SHIFT + dial` for fine steps of `1`) and immediately re-scan: lower values catch only the loudest peaks (fewer slices); higher values catch softer hits/hi-hats (more slices). `N:xx` shows the detected slice count. `SHIFT + VALUE` re-runs detection.
+3. **`>M01`, `>M02`, … (Move & Delete Slice)** — e.g. `>M01 012345 Z1x`
+   - Tap Pad 1–16 (`SHIFT+Pad` for `M17`–`M32`) to select and hear a slice; the number (`012345`) shows its exact start frame (or milliseconds `...m` on long samples >22 s).
+   - Turn `VALUE` dial to nudge that slice's start point left/right (step scales with zoom: 1/16th of the visible window, safely bounded between adjacent slices).
+   - `SHIFT + VALUE` dial quick-zooms `1x`–`32x` centered on the selected slice.
+   - `SHIFT + VALUE` press **deletes** the selected slice mark (`SLICE DELETED!`, minimum 1 slice kept).
+4. **`>ADD` (Manual Add Slice)** — e.g. `>ADD 012345 N:08`
+   - Provides a free-roaming cursor on Row 2 to drop new slice marks by hand.
+   - Turn `VALUE` dial to position the cursor (`SHIFT + dial` to quick-zoom `1x`–`32x`).
+   - Tap any Pad 1–16 to audition audio from the cursor to the end of the sample so you can locate attacks by ear.
+   - `SHIFT + VALUE` press **inserts** a sorted slice mark at the cursor (`SLICE ADDED!`, max 32 slices; rejects duplicates within 64 frames / ~1.4 ms or edges).
+5. **`>Z` (One-Handed Zoom)** — e.g. `>Z 4x  S01/16 ST`
+   - Dedicated one-handed zoom screen (`VALUE` dial selects **`1x`, `2x`, `4x`, `8x`, `16x`, or `32x`** centered on the selected slice) also showing `Sxx/NN` and Stereo (`ST`) / Mono (`MO`). Tapping pads auditions slices and auto-pans the viewport.
+6. **`>ASGN` (Assign Slices to Pads & Clear Pads)** — e.g. `>ASGN ALL>P1  W1`
+   - Exports each assigned slice as a real truncated User Sample in external Wave RAM (`<SourceName>_01`, `_02`, …), syncs to Core 1 DSP, and binds it to Drum Kit pads for permanent project save/reload.
+   - Turn `VALUE` dial to choose target mode:
+     - **`ALL>P1`:** Auto-assigns slices `1–16` → Pads 1–16 (on `W1`, wipes old `WMT2`–`WMT4` and silences leftover unused pads).
+     - **`ALL>Pxx`:** Auto-assigns slices starting at the current source pad.
+     - **`17+>P1`** *(when >16 slices)*: Auto-assigns slices `17–32` → Pads 1–16.
+     - **`CLR P1-16`:** One-click clear of `WMT1`–`WMT4` across all 16 pads.
+     - **`Sxx>P01` … `Sxx>P16`:** Manual single-slice assign for the currently selected slice (`S01`–`S32`). **Shortcut:** tap any Pad 1–16 while in `>ASGN` to select that destination pad directly.
+   - `SHIFT + VALUE` dial chooses target layer **`W1`–`W4`** (`W1` performs a clean pad init & rename; `W2`–`W4` binds non-destructively for layering).
+   - `SHIFT + VALUE` press **commits** the assignment.
+7. **`>SRC` (Source Pad / Layer)** — e.g. `>SRC P01 W1 02.4`
+   - Displays source pad, source layer (`W1`–`W4`), and total sample length in seconds. Turn `VALUE` dial to switch source layer `W1`–`W4`, or tap any Pad 1–16 (with normal pad sound audible) to switch to chopping another pad's sample.
 
 ---
 
