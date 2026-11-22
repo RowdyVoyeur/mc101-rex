@@ -341,22 +341,37 @@ def main() -> int:
         drum_tramp_insns = list(md.disasm(patched[0x602D2A90 - BASE_VA : 0x602D2AE0 - BASE_VA], 0x602D2A90))
         assert len(drum_tramp_insns) >= 12, f"Unexpectedly few instructions in DRUM-ENV-CLIP-HOOK: {len(drum_tramp_insns)}"
 
-        # Verify Phase 2+3: 12-entry Drum Pad SOUND menu, WMT1..4 WAV loader & Sample Edit hooks, and SAMPLE DELETE fix
+        # Verify Phase 2+3 + Sample Chop M1: 13-entry Drum Pad SOUND menu, WMT1..4 WAV loader & Sample Edit hooks,
+        # SAMPLE DELETE fix, relocated 105-entry Screen Table, and Screen 0x68 (SMPL CHOP) C module
         assert patched[0x6006A376 - BASE_VA : 0x6006A378 - BASE_VA] == bytes.fromhex("0728"), "Bad PAD-SND-HDR-SPLIT"
-        assert struct.unpack_from("<I", patched, 0x6006A430 - BASE_VA)[0] == 0x602D3D80, "Bad PAD-SND-MENU-PTR1"
-        assert struct.unpack_from("<I", patched, 0x6006A648 - BASE_VA)[0] == 0x602D3D80, "Bad PAD-SND-MENU-PTR2"
+        assert struct.unpack_from("<I", patched, 0x6006A430 - BASE_VA)[0] == 0x602D48D0, "Bad PAD-SND-MENU-PTR1"
+        assert struct.unpack_from("<I", patched, 0x6006A648 - BASE_VA)[0] == 0x602D48D0, "Bad PAD-SND-MENU-PTR2"
         snd_modes = []
-        for mi in range(12):
-            lbl_va, scr_id, mode = struct.unpack_from("<3I", patched, (0x602D3D80 + mi * 12) - BASE_VA)
+        for mi in range(13):
+            lbl_va, scr_id, mode = struct.unpack_from("<3I", patched, (0x602D48D0 + mi * 12) - BASE_VA)
             l_off = lbl_va - BASE_VA
             lbl = patched[l_off : patched.find(b"\x00", l_off)].decode("ascii")
             snd_modes.append((lbl, scr_id, mode))
         assert [x[0] for x in snd_modes] == [
             "PRESET", "PROJECT", "WAVE FILE", "WMT1 WAVE", "WMT2 WAVE", "WMT3 WAVE", "WMT4 WAVE",
-            "PAD EDIT", "WMT1 SMPL", "WMT2 SMPL", "WMT3 SMPL", "WMT4 SMPL",
+            "PAD EDIT", "WMT1 SMPL", "WMT2 SMPL", "WMT3 SMPL", "WMT4 SMPL", "SMPL CHOP",
         ], f"Unexpected Drum Pad SOUND menu labels: {snd_modes}"
         assert [x[2] for x in snd_modes[2:7]] == [0, 1, 2, 3, 4], f"Unexpected WMT WAVE modes: {snd_modes[2:7]}"
         assert [x[2] for x in snd_modes[8:12]] == [1, 2, 3, 4], f"Unexpected WMT SMPL modes: {snd_modes[8:12]}"
+        assert snd_modes[12] == ("SMPL CHOP", 0x68, 0), f"Unexpected SMPL CHOP menu entry: {snd_modes[12]}"
+        # Verify relocated 105-entry screen table & all 4 pointers
+        for ptr_va in (0x6001D4C4, 0x6001D7A8, 0x6001DF1C, 0x60026008):
+            assert struct.unpack_from("<I", patched, ptr_va - BASE_VA)[0] == 0x602D4220, f"Bad SCR-TBL-PTR @ 0x{ptr_va:08X}"
+        assert patched[0x602D4220 - BASE_VA : 0x602D4220 - BASE_VA + 104 * 16] == \
+            stock[0x601D06D4 - BASE_VA : 0x601D06D4 - BASE_VA + 104 * 16], "Relocated stock screen entries mismatch"
+        assert struct.unpack_from("<4I", patched, 0x602D48A0 - BASE_VA) == (0x602D48C0, 0x0000FF0D, 0, 7), "Bad Screen 0x68 entry"
+        assert struct.unpack_from("<4I", patched, 0x602D48B0 - BASE_VA) == (0, 0, 0, 0), "Missing screen table NULL terminator"
+        assert struct.unpack_from("<I", patched, 0x602D48C0 - BASE_VA)[0] == 0x602D4FE1, "Bad Screen 0x68 handler ptr"
+        for cid, cva in (("CHOP-CODE", 0x602D4FE0), ("CHOP-SLICE", 0x602D5DB0), ("CHOP-DETECT", 0x602D9400)):
+            assert cid in sites_by_id, f"Missing {cid} site"
+            c_insns = list(md.disasm(patched[cva - BASE_VA : cva - BASE_VA + 64], cva))
+            assert len(c_insns) >= 15, f"Unexpectedly few instructions in {cid}: {len(c_insns)}"
+        assert 0x602D3EC8 <= decode_bl(patched, 0x60099B16) < 0x602D40E0, "Bad CHOP-PAD-AUDIO-GATE target"
         assert decode_bl(patched, 0x6006A574) == 0x602D3EC8, "Bad PAD-SND-CLR-HOOK target"
         assert 0x602D3EC8 <= decode_bl(patched, 0x6006A5E0) < 0x602D40E0, "Bad PAD-SND-ENTER-HOOK target"
         assert 0x602D3EC8 <= decode_bl(patched, 0x6002132E) < 0x602D40E0, "Bad PAD-WAV-BIND-WMT target"

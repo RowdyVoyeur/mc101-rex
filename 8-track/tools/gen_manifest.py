@@ -76,6 +76,128 @@ SECTIONS {{
         return bin_file.read_bytes(), syms
 
 
+def compile_c_module(
+    c_path: Path,
+    caves: list[tuple[str, int, int]],
+    ram_va: int,
+    ram_max: int,
+) -> tuple[dict[str, bytes], dict[str, int]]:
+    """Compile freestanding Cortex-M7 Thumb-2 C file across verified code caves with .bss in ram_va.
+
+    `caves` is [(section_label, origin_va, max_len), ...] for CODE1 (.text.entry + .text + .rodata),
+    CODE2 (.text.slice), CODE3 (.text.detect).
+    Returns ({section_label: raw_bytes}, symbol_map).
+    """
+    assert len(caves) == 3
+    (_, va1, max1), (_, va2, max2), (_, va3, max3) = caves
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        o_file = tmp / "mod.o"
+        elf_file = tmp / "mod.elf"
+        ld_file = tmp / "mod.ld"
+
+        ld_file.write_text(
+            f"""
+MEMORY {{
+    CODE1 (rx)  : ORIGIN = 0x{va1:08x}, LENGTH = 0x{max1:x}
+    CODE2 (rx)  : ORIGIN = 0x{va2:08x}, LENGTH = 0x{max2:x}
+    CODE3 (rx)  : ORIGIN = 0x{va3:08x}, LENGTH = 0x{max3:x}
+    RAM   (rwx) : ORIGIN = 0x{ram_va:08x}, LENGTH = 0x{ram_max:x}
+}}
+SECTIONS {{
+    .code1 : {{
+        *(.chop_entry)
+        *(.text*)
+        . = ALIGN(4);
+    }} > CODE1
+    .code2 : {{
+        *(.chop_slice*)
+        *(.rodata*)
+        . = ALIGN(4);
+    }} > CODE2
+    .code3 : {{
+        *(.chop_detect*)
+        . = ALIGN(4);
+    }} > CODE3
+    .data : {{
+        *(.data*)
+    }} > RAM
+    .bss (NOLOAD) : {{
+        *(.chop_state)
+        *(.bss*)
+        *(COMMON)
+    }} > RAM
+    /DISCARD/ : {{ *(.ARM.exidx*) *(.ARM.extab*) *(.comment) *(.note*) }}
+}}
+""",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "arm-none-eabi-gcc",
+                "-mcpu=cortex-m7",
+                "-mthumb",
+                "-Os",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-fno-stack-protector",
+                "-fno-common",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-c",
+                str(c_path),
+                "-o",
+                str(o_file),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "arm-none-eabi-ld",
+                "--gc-sections",
+                "-e",
+                "sample_chop_event",
+                "-T",
+                str(ld_file),
+                str(o_file),
+                "-o",
+                str(elf_file),
+            ],
+            check=True,
+        )
+        # Ensure no initialized .data section exists (all RW state must live in zero-init .bss)
+        sec_hdrs = subprocess.check_output(["arm-none-eabi-objdump", "-h", str(elf_file)], text=True)
+        for line in sec_hdrs.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == ".data":
+                data_sz = int(parts[2], 16)
+                if data_sz != 0:
+                    raise ValueError(f"{c_path.name}: non-empty .data section ({data_sz} B); use const or zero-init static")
+
+        blobs: dict[str, bytes] = {}
+        for idx, (sec_name, _, max_len) in enumerate(caves, start=1):
+            bin_file = tmp / f"code{idx}.bin"
+            subprocess.run(
+                ["arm-none-eabi-objcopy", "-O", "binary", "-j", f".code{idx}", str(elf_file), str(bin_file)],
+                check=True,
+            )
+            raw = bin_file.read_bytes()
+            if len(raw) > max_len:
+                raise ValueError(f"{c_path.name} {sec_name}: {len(raw)} B exceeds budget {max_len} B")
+            blobs[sec_name] = raw
+
+        nm_out = subprocess.check_output(["arm-none-eabi-nm", "-n", str(elf_file)], text=True)
+        syms: dict[str, int] = {}
+        for line in nm_out.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and not parts[2].startswith("$"):
+                syms[parts[2]] = int(parts[0], 16)
+        return blobs, syms
+
+
 def pad_nops(code: bytes, target_len: int) -> bytes:
     if len(code) > target_len:
         raise ValueError(f"assembled code ({len(code)}B) exceeds target length ({target_len}B)")
@@ -288,7 +410,7 @@ def build_drum_pad_edit_blob(base_va: int, max_size: int) -> tuple[bytes, int]:
 
 
 def build_pad_sound_menu_blob(base_va: int, max_size: int) -> tuple[bytes, int]:
-    """Build the 12-entry Drum Pad SOUND menu adding WMT1..4 WAVE loaders and WMT1..4 SMPL editors.
+    """Build the 13-entry Drum Pad SOUND menu adding WMT1..4 WAVE loaders, WMT1..4 SMPL editors, and SMPL CHOP.
 
     Each entry is 12 bytes: (label_ptr, screen_id, mode_param).
     For screen_id 0x4A (WAVE FILE):
@@ -296,6 +418,8 @@ def build_pad_sound_menu_blob(base_va: int, max_size: int) -> tuple[bytes, int]:
       mode_param = 1..4 -> non-destructive load into WMT1..WMT4 (preserving other layers)
     For screen_id 0x5D (SAMPLE EDIT):
       mode_param = 1..4 -> edit User Sample assigned to WMT1..WMT4
+    For screen_id 0x68 (SAMPLE CHOP):
+      mode_param = 0 -> open custom 16x2 LCD waveform & sample chop screen
     """
     entries_spec = [
         (0x602C3FA0, 0x48, 3),  # PRESET (stock)
@@ -310,6 +434,7 @@ def build_pad_sound_menu_blob(base_va: int, max_size: int) -> tuple[bytes, int]:
         ("WMT2 SMPL", 0x5D, 2),  # Sample Edit for WMT2 user sample
         ("WMT3 SMPL", 0x5D, 3),  # Sample Edit for WMT3 user sample
         ("WMT4 SMPL", 0x5D, 4),  # Sample Edit for WMT4 user sample
+        ("SMPL CHOP", 0x68, 0),  # Sample Chop waveform & slicing screen (Screen 0x68)
     ]
     num_entries = len(entries_spec)
     str_offset = num_entries * 12
@@ -759,9 +884,61 @@ tramp_pad_edit_env_clip:
     drum_pad_edit_blob, drum_pad_sec_cnt = build_drum_pad_edit_blob(drum_pad_edit_va, 0x602D3D80 - drum_pad_edit_va)
     print(f"[+] Drum Pad Edit blob @0x{drum_pad_edit_va:08X}: {len(drum_pad_edit_blob)} / {0x602D3D80 - drum_pad_edit_va} bytes ({drum_pad_sec_cnt} sections)")
 
-    # 4. Phase 2+3: 12-entry Drum Pad SOUND menu + WMT1..4 WAV loader + WMT1..4 SAMPLE EDIT + SAMPLE DELETE fix
-    pad_snd_menu_va = 0x602D3D80
-    pad_snd_menu_blob, pad_snd_menu_cnt = build_pad_sound_menu_blob(pad_snd_menu_va, 0x602D3E60 - pad_snd_menu_va)
+    # 4. Phase 2+3 + Sample Chop Milestone 1:
+    #    - CHOP-CAVE-0 (0x602D4220..0x602D4EFF, 3,296 B, verified zero knob-table padding):
+    #        0x602D4220..0x602D48BF: 105-entry relocated screen table (0x00..0x67 + 0x68 SMPL CHOP + NULL)
+    #        0x602D48C0..0x602D48CF: Screen 0x68 descriptor { sample_chop_event | 1, 0, 0, 0 }
+    #        0x602D48D0..0x602D49CF: 13-entry Drum Pad SOUND menu (relocated from 0x602D3D80)
+    #        0x602D4A00..0x602D4EFF: CHOP_RAM (1,280 B zero-init .bss for sample_chop.c)
+    #    - CHOP-CAVE-1 (0x602D4FE0..0x602D5CCF, 3,312 B, verified zero knob-table padding):
+    #        0x602D4FE0..: compiled C code + rodata from 8-track/src/sample_chop.c
+    scr_tbl_va = 0x602D4220
+    scr_68_desc_va = 0x602D48C0
+    pad_snd_menu_va = 0x602D48D0
+    chop_ram_va = 0x602D4A00
+    chop_ram_max = 0x0500
+    chop_code1_va, chop_code1_max = 0x602D4FE0, 0x0CF0  # 3,312 B
+    chop_code2_va, chop_code2_max = 0x602D5DB0, 0x0CF0  # 3,312 B
+    chop_code3_va, chop_code3_max = 0x602D9400, 0x0CE0  # 3,296 B
+
+    chop_c_path = REPO_ROOT / "8-track/src/sample_chop.c"
+    chop_blobs, chop_syms = compile_c_module(
+        chop_c_path,
+        [
+            ("CHOP-CODE", chop_code1_va, chop_code1_max),
+            ("CHOP-SLICE", chop_code2_va, chop_code2_max),
+            ("CHOP-DETECT", chop_code3_va, chop_code3_max),
+        ],
+        chop_ram_va,
+        chop_ram_max,
+    )
+    chop_code_blob = chop_blobs["CHOP-CODE"]
+    chop_slice_blob = chop_blobs["CHOP-SLICE"]
+    chop_detect_blob = chop_blobs["CHOP-DETECT"]
+    assert chop_syms.get("sample_chop_event") == chop_code1_va, (
+        f"sample_chop_event expected at 0x{chop_code1_va:08X}, got {hex(chop_syms.get('sample_chop_event', 0))}"
+    )
+    chop_state_va = chop_syms.get("g_chop")
+    assert chop_state_va == chop_ram_va, (
+        f"g_chop expected at 0x{chop_ram_va:08X}, got {hex(chop_state_va or 0)}"
+    )
+    print(
+        f"[+] Sample Chop C module: CODE1={len(chop_code_blob)}/{chop_code1_max}B @0x{chop_code1_va:08X}, "
+        f"SLICE={len(chop_slice_blob)}/{chop_code2_max}B @0x{chop_code2_va:08X}, "
+        f"DETECT={len(chop_detect_blob)}/{chop_code3_max}B @0x{chop_code3_va:08X}"
+    )
+
+    # Build extended 105-entry screen table (stock 104 entries @ 0x601D06D4 + Screen 0x68 + NULL terminator)
+    stock_scr_tbl_off = 0x601D06D4 - BASE_VA
+    scr_tbl_blob = (
+        image[stock_scr_tbl_off : stock_scr_tbl_off + 104 * 16]
+        + struct.pack("<4I", scr_68_desc_va, 0x0000FF0D, 0, 7)
+        + struct.pack("<4I", 0, 0, 0, 0)
+    )
+    assert len(scr_tbl_blob) == 106 * 16 == 1696
+    scr_68_desc_blob = struct.pack("<4I", chop_code1_va | 1, 0, 0, 0)
+
+    pad_snd_menu_blob, pad_snd_menu_cnt = build_pad_sound_menu_blob(pad_snd_menu_va, 0x602D4A00 - pad_snd_menu_va)
     print(f"[+] Drum Pad SOUND menu blob @0x{pad_snd_menu_va:08X}: {len(pad_snd_menu_blob)} bytes ({pad_snd_menu_cnt} items)")
 
     smpl_edit_descs_va = 0x602D3E60
@@ -980,6 +1157,28 @@ tramp_smpl_edit_hdr:
     mla     r1, ip, r3, r1
 1:
     b.w     fw_list_set_descs
+
+    .balign 2
+    .thumb_func
+    .global tramp_pad_audio_gate
+tramp_pad_audio_gate:
+    @ Hooked at 0x60099B16 (stock: ldrb.w r0, [r0, #0x114]):
+    @ Suppress stock physical pad audio when SMPL CHOP is active with a loaded sample
+    @ (except MODE_SRC=6 where tapping pads switches & auditions source pads).
+    movw    r1, #0x{chop_state_va & 0xFFFF:04x}
+    movt    r1, #0x{(chop_state_va >> 16) & 0xFFFF:04x}
+    ldrb    r2, [r1, #0]        @ g_chop.active
+    cbz     r2, 1f
+    ldrb    r2, [r1, #2]        @ g_chop.valid
+    cbz     r2, 1f
+    ldrb    r2, [r1, #3]        @ g_chop.mode
+    cmp     r2, #6              @ MODE_SRC?
+    beq     1f
+    movs    r0, #0
+    bx      lr
+1:
+    ldrb.w  r0, [r0, #0x114]
+    bx      lr
 """
     drum_p2_raw, drum_p2_syms = assemble_thumb(drum_p2_va, drum_p2_asm, drum_p2_ext)
     drum_p2_code = pad_nops(drum_p2_raw, (len(drum_p2_raw) + 3) & ~3)
@@ -1531,7 +1730,7 @@ tramp_smpl_edit_hdr:
             pad_snd_menu_blob.hex(),
             "drum",
             "table",
-            "12-entry Drum Pad SOUND menu adding non-destructive WMT1..4 WAVE loaders and WMT1..4 SMPL editors.",
+            "13-entry Drum Pad SOUND menu (relocated to CHOP-CAVE-0) adding WMT1..4 WAVE, WMT1..4 SMPL, and SMPL CHOP (Screen 0x68).",
         ),
         (
             "SMPL-EDIT-DESCS",
@@ -1558,7 +1757,7 @@ tramp_smpl_edit_hdr:
             "0728",
             "drum",
             "code",
-            "Drum Pad SOUND menu header split: cmp r0, #3 -> #7 so PRESET/PROJECT/WAVE FILE/WMT1..4 WAVE show BROWSER and PAD EDIT/WMT1..4 SMPL show EDIT.",
+            "Drum Pad SOUND menu header split: cmp r0, #3 -> #7 so PRESET/PROJECT/WAVE FILE/WMT1..4 WAVE show BROWSER and PAD EDIT/WMT1..4 SMPL/SMPL CHOP show EDIT.",
         ),
         (
             "PAD-SND-MENU-PTR1",
@@ -1567,7 +1766,7 @@ tramp_smpl_edit_hdr:
             struct.pack("<I", pad_snd_menu_va).hex(),
             "drum",
             "table",
-            "Drum Pad SOUND menu draw literal: repoint 0x6021C168 -> 0x602D3D80.",
+            "Drum Pad SOUND menu draw literal: repoint 0x6021C168 -> 0x602D48D0.",
         ),
         (
             "PAD-SND-MENU-PTR2",
@@ -1576,7 +1775,7 @@ tramp_smpl_edit_hdr:
             struct.pack("<I", pad_snd_menu_va).hex(),
             "drum",
             "table",
-            "Drum Pad SOUND menu Enter literal: repoint 0x6021C168 -> 0x602D3D80.",
+            "Drum Pad SOUND menu Enter literal: repoint 0x6021C168 -> 0x602D48D0.",
         ),
         (
             "PAD-SND-CNT-DIAL",
@@ -1584,12 +1783,12 @@ tramp_smpl_edit_hdr:
             24,
             asm_at(
                 0x6006A46C,
-                "cmp.w ip, #1\nit eq\nmoveq r0, #5\ncmp.w ip, #2\nit eq\nmoveq r0, #2\ncmp.w ip, #3\nit eq\nmoveq r0, #12",
+                "cmp.w ip, #1\nit eq\nmoveq r0, #5\ncmp.w ip, #2\nit eq\nmoveq r0, #2\ncmp.w ip, #3\nit eq\nmoveq r0, #13",
                 24,
             ),
             "drum",
             "code",
-            "Drum Pad SOUND menu dial scroll bound: widen mode 3 (Drum Pad) item count from 5 to 12 while keeping Drum Kit = 5 and Looper = 2.",
+            "Drum Pad SOUND menu dial scroll bound: widen mode 3 (Drum Pad) item count from 5 to 13 while keeping Drum Kit = 5 and Looper = 2.",
         ),
         (
             "PAD-SND-CNT-LEFT",
@@ -1597,12 +1796,12 @@ tramp_smpl_edit_hdr:
             24,
             asm_at(
                 0x6006A4FA,
-                "cmp.w ip, #1\nit eq\nmoveq r1, #5\ncmp.w ip, #2\nit eq\nmoveq r1, #2\ncmp.w ip, #3\nit eq\nmoveq r1, #12",
+                "cmp.w ip, #1\nit eq\nmoveq r1, #5\ncmp.w ip, #2\nit eq\nmoveq r1, #2\ncmp.w ip, #3\nit eq\nmoveq r1, #13",
                 24,
             ),
             "drum",
             "code",
-            "Drum Pad SOUND menu LEFT button bound: widen mode 3 (Drum Pad) item count from 5 to 12.",
+            "Drum Pad SOUND menu LEFT button bound: widen mode 3 (Drum Pad) item count from 5 to 13.",
         ),
         (
             "PAD-SND-CNT-RIGHT",
@@ -1610,12 +1809,12 @@ tramp_smpl_edit_hdr:
             24,
             asm_at(
                 0x6006A546,
-                "cmp.w ip, #1\nit eq\nmoveq r1, #5\ncmp.w ip, #2\nit eq\nmoveq r1, #2\ncmp.w ip, #3\nit eq\nmoveq r1, #12",
+                "cmp.w ip, #1\nit eq\nmoveq r1, #5\ncmp.w ip, #2\nit eq\nmoveq r1, #2\ncmp.w ip, #3\nit eq\nmoveq r1, #13",
                 24,
             ),
             "drum",
             "code",
-            "Drum Pad SOUND menu RIGHT button bound: widen mode 3 (Drum Pad) item count from 5 to 12.",
+            "Drum Pad SOUND menu RIGHT button bound: widen mode 3 (Drum Pad) item count from 5 to 13.",
         ),
         (
             "PAD-SND-CLR-HOOK",
@@ -1679,6 +1878,97 @@ tramp_smpl_edit_hdr:
             "drum",
             "hook",
             "Screen 0x5D (SAMPLE EDIT) OnCreate: show 'WMT1 SAMPLE:'..'WMT4 SAMPLE:' header when editing a Drum Pad WMT layer.",
+        ),
+        # Sample Chop Milestone 1: Relocated 105-entry Screen Table + Screen 0x68 (SMPL CHOP) C module
+        (
+            "SCR-TBL-EXT",
+            scr_tbl_va,
+            len(scr_tbl_blob),
+            scr_tbl_blob.hex(),
+            "chop",
+            "table",
+            "Relocated 105-entry Screen Table (stock 0x00..0x67 + new Screen 0x68 SMPL CHOP + NULL) in verified zero padding CHOP-CAVE-0.",
+        ),
+        (
+            "SCR-68-DESC",
+            scr_68_desc_va,
+            len(scr_68_desc_blob),
+            scr_68_desc_blob.hex(),
+            "chop",
+            "table",
+            "Screen 0x68 (SMPL CHOP) descriptor pointing to sample_chop_event @ 0x602D4FE1.",
+        ),
+        (
+            "SCR-TBL-PTR1",
+            0x6001D4C4,
+            4,
+            struct.pack("<I", scr_tbl_va).hex(),
+            "chop",
+            "table",
+            "Screen Init literal: repoint screen table 0x601D06D4 -> 0x602D4220.",
+        ),
+        (
+            "SCR-TBL-PTR2",
+            0x6001D7A8,
+            4,
+            struct.pack("<I", scr_tbl_va).hex(),
+            "chop",
+            "table",
+            "Screen Switch literal: repoint screen table 0x601D06D4 -> 0x602D4220.",
+        ),
+        (
+            "SCR-TBL-PTR3",
+            0x6001DF1C,
+            4,
+            struct.pack("<I", scr_tbl_va).hex(),
+            "chop",
+            "table",
+            "DispatchScreenEvent literal: repoint screen table 0x601D06D4 -> 0x602D4220.",
+        ),
+        (
+            "SCR-TBL-PTR4",
+            0x60026008,
+            4,
+            struct.pack("<I", scr_tbl_va).hex(),
+            "chop",
+            "table",
+            "Screen LED/Key map literal: repoint screen table 0x601D06D4 -> 0x602D4220.",
+        ),
+        (
+            "CHOP-CODE",
+            chop_code1_va,
+            len(chop_code_blob),
+            chop_code_blob.hex(),
+            "chop",
+            "code",
+            "Sample Chop UI/waveform C module (16x2 CGRAM waveform + slice/transient markers, zoom, audition, Screen 0x68 event loop) in CHOP-CAVE-1.",
+        ),
+        (
+            "CHOP-SLICE",
+            chop_code2_va,
+            len(chop_slice_blob),
+            chop_slice_blob.hex(),
+            "chop",
+            "code",
+            "Sample Chop Wave RAM truncator, User Sample slot creator, Core 1 IPC sync, and Auto/Manual Pad assignment in CHOP-CAVE-2.",
+        ),
+        (
+            "CHOP-DETECT",
+            chop_code3_va,
+            len(chop_detect_blob),
+            chop_detect_blob.hex(),
+            "chop",
+            "code",
+            "Sample Chop equal-step slicer (1/4/8/16/32), Auto Transient onset detector, and manual slice add/delete/nudge in CHOP-CAVE-3.",
+        ),
+        (
+            "CHOP-PAD-AUDIO-GATE",
+            0x60099B16,
+            4,
+            asm_at(0x60099B16, "bl tramp_pad_audio_gate", 4),
+            "chop",
+            "hook",
+            "Physical Pad audio gate (0x60099AF0): suppress stock kit pad playback while SMPL CHOP is active so Pads 1..16 audition slices cleanly.",
         ),
     ]
 
