@@ -1162,3 +1162,48 @@ The NARROW-REG image (whole CRC `0x4539FDD6`) was flashed and probed live
    written — the ESC2 applies a per-slot, per-product **write-enable mask**. Static
    write-byte audits must be paired with a readback probe before predicting routing
    behaviour; the readback is the hardware truth.
+
+---
+
+## 12. MC-707-Depth Drum Pad Edit, WMT1–4 Sample Tools, & Sample Chop (Screen `0x68`)
+
+All additions below run purely on Core 0 (`RPG69_C0A_up.bin`) using verified zero-padded SDRAM knob-table tails (100% zero in stock, zero incoming references) and stock Zen-Core / Wave RAM / Core 1 IPC primitives.
+
+### 12.1 Memory Map (Verified Zero-Padded SDRAM Caves)
+
+| Region | Address Range | Size | Purpose |
+| :--- | :--- | ---: | :--- |
+| `DRUM-ENV-CLIP-HOOK` | `0x602D2A90..0x602D2ACF` | 64 B | Clip sync trampoline for Pitch/TVF/TVA Env param groups (`0x104+trk`, `0x10D+trk`, `0x116+trk`) |
+| `DRUM-PAD-EDIT-TBL` | `0x602D2B00..0x602D3D7F` | 4,736 B | 11-section Drum Pad Edit descriptor + 147 new `ITEM_LIST_PRM` entries + deduplicated labels |
+| `SMPL-EDIT-DESCS` | `0x602D3E60..0x602D3EC3` | 100 B | 4 × 12-byte section descriptors + `"WMT1..4 SMPL:"` headers for Screen `0x5D` |
+| `DRUM-PHASE2-HOOKS` | `0x602D3EC8..0x602D40DF` | 536 B | Thumb-2 trampolines (`tramp_snd_clear_wmt`, `tramp_pad_snd_enter`, `tramp_bind_pad_wav_wmt`, `tramp_sample_del_wmt_scan`, `tramp_smpl_edit_get_id`, `tramp_smpl_edit_hdr`, `tramp_pad_audio_gate`) |
+| `CHOP-CAVE-0` (`SCR-TBL-EXT`) | `0x602D4220..0x602D48BF` | 1,696 B | Relocated 105-entry Screen Table (stock 104 entries from `0x601D06D4` + Screen `0x68` + NULL) |
+| `CHOP-CAVE-0` (`SCR-68-DESC`) | `0x602D48C0..0x602D48CF` | 16 B | Screen `0x68` descriptor `{ 0x602D4FE1, 0, 0, 0 }` |
+| `CHOP-CAVE-0` (`PAD-SND-MENU-TBL`) | `0x602D48D0..0x602D49C7` | 248 B | Relocated 13-entry Drum Pad Sound Menu (`PRESET`, `PROJECT`, `WAVE FILE`, `WMT1..4 WAVE`, `PAD EDIT`, `WMT1..4 SMPL`, `SMPL CHOP`) |
+| `CHOP-CAVE-0` (`CHOP-RAM`) | `0x602D4A00..0x602D4EFF` | 1,280 B | Zero-init `.bss` for `sample_chop.c` (`g_chop` pinned at `0x602D4A00` via `.chop_state`, `g_env[128]`, `g_chunk[256]`) |
+| `CHOP-CAVE-1` (`CHOP-CODE`) | `0x602D4FE0..0x602D5CCF` | 3,312 B | `sample_chop.c` `.chop_entry` + `.text` (entry, event loop, audition, live WMT solo/restore, LCD helpers) |
+| `CHOP-CAVE-2` (`CHOP-SLICE`) | `0x602D5DB0..0x602D6A9F` | 3,312 B | `sample_chop.c` `.chop_slice` + `.rodata` (Wave RAM truncator, User Sample creation, Core 1 IPC `0xFFFA`, Pad assignment, LCD renderer) |
+| `CHOP-CAVE-3` (`CHOP-DETECT`) | `0x602D9400..0x602DA0DF` | 3,296 B | `sample_chop.c` `.chop_detect` (step slicer, 128-bin onset-flux transient detector, manual slice add/delete/nudge, sample loader) |
+
+### 12.2 Phase 1 — MC-707-Depth Drum Pad Edit
+
+- **`PAD-EDIT-ENV-CLIP` (`0x6004E108`), `PAD-EDIT-SEC-CNT` (`0x6004E12A`), `PAD-EDIT-SEC-PTR` (`0x6004E1A8`)**: Widens Screen `0x34` (`PAD EDIT`) from 3 to 11 sections pointing to `DRUM-PAD-EDIT-TBL` while keeping `INST EDIT` at index 1 (preserving stock `0x6004E1E8` Env Mode ↔ TVA T4 sync). `DRUM-ENV-CLIP-HOOK` sets the active clip on the 3 envelope parameter groups (`0x104+trk`, `0x10D+trk`, `0x116+trk`) alongside stock `0xFB+trk`.
+- **`WMT4-FMT-BUGFIX` (`0x6008BB0A`) & `WMT4-SET-BUGFIX` (`0x6008BE04`)**: Fixes two stock Roland bugs in `DrumInst` formatting/setting where `WMT4` Bank/Type checked the wrong relative PID (`0x60`/`0x61` vs `WMT3`).
+
+### 12.3 Phase 2 — Per-Layer `WMT1..4 WAVE` & `WMT1..4 SMPL`
+
+- **`PAD-SND-*` (`0x6006A376..0x6006A648`)**: Repoints the Drum Pad Sound Menu to `PAD-SND-MENU-TBL` (13 entries), widens dial/left/right bounds from 5 to 13, and stores the selected WMT slot (`1..4`) in scratch SRAM (`0x602D2AF8`/`0x602D2AFC`) via `tramp_pad_snd_enter` / `tramp_snd_clear_wmt`.
+- **`PAD-WAV-BIND-WMT` (`0x6002132E` → `tramp_bind_pad_wav_wmt`)**: When `mode_param == 0` (`WAVE FILE`), tail-calls stock `fw_bind_pad_wav` (`0x600299A4`). When `mode_param == 1..4` (`WMT1..4 WAVE`), writes `SW=1, GTYPE=2 (SAMP), WAV_NUM_L=sample_id+1` directly into `FW_DRUM_INST_TBL[trk] + clip*0x4A40 + pad_idx*0xD8 + 0x1C + wmt*0x1C` with audible defaults (`Level=127`, `Velo=1..127`), ensures `KitPad.InstNum != 0`, and calls `fw_mark_clip_dirty` (`0x6001A1A2`) without wiping other WMT layers or EQ/filter settings.
+- **`SMPL-EDIT-GET1/2` (`0x6007C3BE`, `0x6007C504`) & `SMPL-EDIT-HDR` (`0x6007C468`)**: Redirects Screen `0x5D` (`SAMPLE EDIT`) to look up `WMT[w]` (`0x8E2 + w*0x17` Type / `0x8E4 + w*0x17` Wave L) via `fw_get_inst_prm` (`0x6009C064`) and display `"WMT1..4 SMPL:"`.
+- **`SAMPLE-DEL-WMT-FIX` (`0x600877D6` → `tramp_sample_del_wmt_scan`)**: Loops over all 4 WMT slots (`stride 0x1C`) inside the Sample Delete usage scanner so User Samples assigned to `WMT2..4` are marked in-use.
+
+### 12.4 Phase 3 — Sample Chop (`src/sample_chop.c`, Screen `0x68`)
+
+- **Screen registration (`SCR-TBL-PTR1..4` @ `0x6001D4C4`, `0x6001D7A8`, `0x6001DF1C`, `0x60026008`)**: Repoints all 4 screen-table literals to `SCR-TBL-EXT` (`0x602D4220`) adding Screen `0x68` (`sample_chop_event`).
+- **External Wave RAM hardware bridge (ITCM)**: `fw_get_sample_info` (`0x6004F880`) returns external 64 MB ERAM byte offsets, **not** Cortex-M7 SDRAM pointers. All waveform peak scans, transient detection, and slice truncation stream PCM through ITCM `0x01011D28` (`read16`), `0x01011D5E` (`bulk read`), and `0x0102C138` (`bulk write`, 4-byte aligned, with 64-byte zero lead-in/tail padding for Core 1's interpolator).
+- **LCD CGRAM rendering**: Uploads 6 bar-height glyphs (slots `1..6`), a slice/transient tick (slot `7`), and a dynamic active-cursor + bar glyph (slot `0`) via `0x600974A4` / `0x60097554` without calling `0x60097520` directly (avoiding SPI7 race with the LCD task), and invalidates the CGRAM cache (`0x6009DBA4(0x60AD3E8A, 8)`) on `EV_CLOSE`.
+- **Isolated live slice audition**:
+  - **`CHOP-PAD-AUDIO-GATE` (`0x60099B16` → `tramp_pad_audio_gate`)**: Gates stock physical pad playback in `0x60099AF0` while `g_chop.active && g_chop.valid && g_chop.mode != MODE_SRC` (`g_chop` pinned at `0x602D4A00` via `.chop_state` and asserted at build time).
+  - **Live WMT layer soloing**: Uses Roland's live parameter API `fw_set_param(0xFB + track, 0x8E1 + w*0x17, want, pad_idx, clip)` (`WMT1..4 Switch`) and `pid = 0x8E0` (`WMT Velo`) so Core 1 DSP immediately mutes all other WMT layers (both Preset `INT` waves and other `SAMP` layers) on the source pad during preview and restores them on `EXIT`/pad change.
+  - **Real-time trigger**: Temporarily sets source User Sample Start/End (`0x11F / 0x98D, 0x98F`) and sends real-time Note-Off/Note-On directly to Core 1 internal synth port `2` (`0x60019FD6` → `0x60019FE0(2, msg)` → `0x60019EFA`).
+- **Real truncated User Sample creation & Core 1 sync (`create_sliced_sample`)**: Allocates a free sample slot (`0..499`) and contiguous 32 KB Wave RAM blocks (`0x6002645C`), copies PCM + 64 B lead-in/tail zeros, populates 40-byte `SampleHeader` L/R entries + 1-to-1 block ownership (`0x6001A526`), initializes sample params (`0x6002DEEC`), pushes sample metadata to Core 1 via IPC `0xFFFA` (`0x60096510` → `0x60096548` → `0x6002D1AC` → `0x60019F36`), binds via `fw_bind_pad_wav` (`0x600299A4`, default `W1`) or non-destructive WMT bind (`W2..4`), and marks/syncs the clip (`0x6001A1A2`, `0x60046434`).
